@@ -5,6 +5,7 @@ import json
 import logging
 import sys
 import pandas as pd
+import numpy as np
 from shutil import copytree, rmtree
 
 def load_config(config_path=None):
