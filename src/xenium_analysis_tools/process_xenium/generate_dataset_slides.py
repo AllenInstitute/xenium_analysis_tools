@@ -4,7 +4,6 @@ import os
 import gc 
 import pandas as pd
 import numpy as np
-from shutil import copytree, rmtree
 
 from xenium_analysis_tools.utils.io_utils import (
     atomic_write_sdata, 
@@ -12,7 +11,8 @@ from xenium_analysis_tools.utils.io_utils import (
     is_complete_store, 
     load_config, 
     setup_logging,
-    get_sections_df
+    get_sections_df,
+    get_partial_dataset
 )
 from xenium_analysis_tools.process_xenium.process_spatialdata import read_xenium_slide
 
@@ -37,39 +37,6 @@ def find_xenium_bundle(bundle_name, data_folder='/root/capsule/data'):
                 path_to_bundle = found_dirs[0]
                 break
     return path_to_bundle
-
-def get_data_folder_slides(dataset_name, source_path, dest_path):
-    """Copy slide data from source to destination, handling incomplete files."""
-    # Find slides
-    slides = list(source_path.glob('slide_*.zarr'))
-    if not slides:
-        print(f"No slides found in {source_path}")
-        return
-    
-    # Create destination directory
-    dest_path.mkdir(parents=True, exist_ok=True)
-    
-    # Copy slides
-    for slide in slides:
-        print(f"Checking {slide.name}...")
-        dest_slide = dest_path / slide.name
-        
-        # Skip if destination already complete
-        if dest_slide.exists() and is_complete_store(dest_slide):
-            print(f"{slide.name} already complete")
-            continue
-        
-        # Only copy if source is valid
-        if not is_complete_store(slide):
-            print(f"{slide.name} source incomplete, skipping")
-            continue
-        
-        # Remove incomplete destination and copy
-        if dest_slide.exists():
-            rmtree(dest_slide)
-            
-        copytree(slide, dest_slide)
-        print(f"Copied {slide.name}")
     
 def generate_slides(dataset_name: str, config_path: str=None, select_sections: list[int]|None = None):
     """
@@ -99,8 +66,8 @@ def generate_slides(dataset_name: str, config_path: str=None, select_sections: l
     if processing_config['check_data_folder_slides']:
         logger.info("Checking and copying slides from data folder if exist...")
         data_folder_slides_path = Path(paths['data_root']) / f'{dataset_name}{processing_config["save_initial_dataset_suffix"]}'
-        get_data_folder_slides(dataset_name, data_folder_slides_path, save_sections_path)
-    
+        get_partial_dataset(data_folder_slides_path, save_sections_path, pattern='slide_*', subset_ids=select_sections)
+
     # Get the slides information
     sections_df = get_sections_df(raw_data_folder)
 

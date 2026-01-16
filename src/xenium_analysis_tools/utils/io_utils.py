@@ -5,6 +5,7 @@ import json
 import logging
 import sys
 import pandas as pd
+from shutil import copytree, rmtree
 
 def load_config(config_path=None):
     if config_path is not None:
@@ -141,3 +142,47 @@ def safe_copy_tree(src: Path, dst: Path):
         shutil.rmtree(dst)
     
     shutil.copytree(src, dst)
+
+def get_partial_dataset(source_path, dest_path, pattern='section_*', subset_ids=None):
+    """Copy slide data from source to destination, handling incomplete files."""
+    # Find matches
+    all_matches = list(source_path.glob(pattern))
+
+    # Filter matches to only include sections in subset_ids
+    if subset_ids is not None:
+        matches = []
+        for m in all_matches:
+            section_ids = m.stem.split('_')[1:]
+            if any(int(sid) in subset_ids for sid in section_ids):
+                matches.append(m)
+    else:
+        matches = all_matches
+
+    if not matches:
+        print(f"No matches found in {source_path}")
+        return
+    
+    # Create destination directory
+    dest_path.mkdir(parents=True, exist_ok=True)
+    
+    # Copy slides
+    for ma in matches:
+        print(f"Checking {ma.name}...")
+        dest_slide = dest_path / ma.name
+
+        # Skip if destination already complete
+        if dest_slide.exists() and is_complete_store(dest_slide):
+            print(f"{ma.name} already complete")
+            continue
+        
+        # Only copy if source is valid
+        if not is_complete_store(ma):
+            print(f"{ma.name} source incomplete, skipping")
+            continue
+        
+        # Remove incomplete destination and copy
+        if dest_slide.exists():
+            rmtree(dest_slide)
+
+        copytree(ma, dest_slide)
+        print(f"Copied {ma.name}")
