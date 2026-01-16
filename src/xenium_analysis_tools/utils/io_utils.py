@@ -143,6 +143,28 @@ def safe_copy_tree(src: Path, dst: Path):
     
     shutil.copytree(src, dst)
 
+def find_xenium_bundle(bundle_name, data_folder='/root/capsule/data'):
+    data_folder = Path(data_folder)
+    search_paths = [
+        data_folder / 'xenium_data',
+        data_folder / 'Xenium_output_pilot'
+    ]
+    search_paths = [path for path in search_paths if path.exists()]
+    all_dirs = np.concatenate([list(folder.iterdir()) for folder in search_paths])
+    output_folders = np.concatenate([list(folder.glob('output-*')) for folder in search_paths])
+    subfolders = np.setdiff1d(all_dirs, output_folders)
+    path_to_bundle = None
+    found_dirs = [dir for dir in output_folders if dir.name == bundle_name]
+    if found_dirs:
+        path_to_bundle = found_dirs[0]
+    else:
+        for sub in subfolders:
+            found_dirs = [dir for dir in list(sub.iterdir()) if dir.name == bundle_name]
+            if found_dirs:
+                path_to_bundle = found_dirs[0]
+                break
+    return path_to_bundle
+
 def get_partial_dataset(source_path, dest_path, pattern='section_*', subset_ids=None):
     """Copy slide data from source to destination, handling incomplete files."""
     # Find matches

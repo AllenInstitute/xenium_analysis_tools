@@ -15,28 +15,6 @@ from xenium_analysis_tools.utils.io_utils import (
     get_partial_dataset
 )
 from xenium_analysis_tools.process_xenium.process_spatialdata import read_xenium_slide
-
-def find_xenium_bundle(bundle_name, data_folder='/root/capsule/data'):
-    data_folder = Path(data_folder)
-    search_paths = [
-        data_folder / 'xenium_data',
-        data_folder / 'Xenium_output_pilot'
-    ]
-    search_paths = [path for path in search_paths if path.exists()]
-    all_dirs = np.concatenate([list(folder.iterdir()) for folder in search_paths])
-    output_folders = np.concatenate([list(folder.glob('output-*')) for folder in search_paths])
-    subfolders = np.setdiff1d(all_dirs, output_folders)
-    path_to_bundle = None
-    found_dirs = [dir for dir in output_folders if dir.name == bundle_name]
-    if found_dirs:
-        path_to_bundle = found_dirs[0]
-    else:
-        for sub in subfolders:
-            found_dirs = [dir for dir in list(sub.iterdir()) if dir.name == bundle_name]
-            if found_dirs:
-                path_to_bundle = found_dirs[0]
-                break
-    return path_to_bundle
     
 def generate_slides(dataset_name: str, config_path: str=None, select_sections: list[int]|None = None):
     """
