@@ -4,6 +4,7 @@ import os
 import gc 
 import pandas as pd
 import numpy as np
+from shutil import copytree, rmtree
 
 from xenium_analysis_tools.utils.io_utils import (
     atomic_write_sdata, 
@@ -36,6 +37,39 @@ def find_xenium_bundle(bundle_name, data_folder='/root/capsule/data'):
                 path_to_bundle = found_dirs[0]
                 break
     return path_to_bundle
+
+def get_data_folder_slides(dataset_name, source_path, dest_path):
+    """Copy slide data from source to destination, handling incomplete files."""
+    # Find slides
+    slides = list(source_path.glob('slide_*.zarr'))
+    if not slides:
+        print(f"No slides found in {source_path}")
+        return
+    
+    # Create destination directory
+    dest_path.mkdir(parents=True, exist_ok=True)
+    
+    # Copy slides
+    for slide in slides:
+        print(f"Checking {slide.name}...")
+        dest_slide = dest_path / slide.name
+        
+        # Skip if destination already complete
+        if dest_slide.exists() and is_complete_store(dest_slide):
+            print(f"{slide.name} already complete")
+            continue
+        
+        # Only copy if source is valid
+        if not is_complete_store(slide):
+            print(f"{slide.name} source incomplete, skipping")
+            continue
+        
+        # Remove incomplete destination and copy
+        if dest_slide.exists():
+            rmtree(dest_slide)
+            
+        copytree(slide, dest_slide)
+        print(f"Copied {slide.name}")
     
 def generate_slides(dataset_name: str, config_path: str=None, select_sections: list[int]|None = None):
     """
@@ -43,22 +77,39 @@ def generate_slides(dataset_name: str, config_path: str=None, select_sections: l
     """
     # ---- Set up ----
     config = load_config(config_path)
+
+    # Paths/directories
     paths = config['paths']
     processing_config = config['processing_control']
     raw_data_folder = Path(paths['data_root']) / dataset_name
     save_sections_parent_folder = processing_config['save_initial_data_parent_folder']
     save_sections_path = Path(paths[f'{save_sections_parent_folder}_root']) / f"{dataset_name}{processing_config['save_initial_dataset_suffix']}"
     save_sections_path.mkdir(parents=True, exist_ok=True)
+
+    # Logger
     logger, log_file_path = setup_logging(save_sections_path)
+
+    # Print out where slides are being saved
     logger.info(f"Dataset Name: {dataset_name}")
     logger.info(f"Configuration loaded from {config_path}")
     logger.info(f"Raw data folder: {raw_data_folder}")
     logger.info(f"Slides will be saved to: {save_sections_path}")
+
+    # If specified, copy slides from data folder instead of re-generating
+    if processing_config['check_data_folder_slides']:
+        logger.info("Checking and copying slides from data folder if exist...")
+        data_folder_slides_path = Path(paths['data_root']) / f'{dataset_name}{processing_config["save_initial_dataset_suffix"]}'
+        get_data_folder_slides(dataset_name, data_folder_slides_path, save_sections_path)
+    
+    # Get the slides information
     sections_df = get_sections_df(raw_data_folder)
+
     # Limit sections, if specified
     if select_sections is not None:
         logger.info(f"Limiting processing to sections: {select_sections}")
         sections_df = sections_df[sections_df['section'].isin(select_sections)]
+    
+    # Set up processing loop
     logger.info(f"Processing {len(sections_df)} sections from {sections_df['slide_id'].nunique()} slide(s)")
     unique_slides = sections_df.groupby('slide_id')
 
@@ -68,15 +119,20 @@ def generate_slides(dataset_name: str, config_path: str=None, select_sections: l
                                 unit="slide",
                                 total=len(unique_slides.groups.keys())):
         try:
+            # Get slide information
             group = unique_slides.get_group(slide_id)
             slide_row = group.iloc[0]
             raw_slide_path = raw_data_folder / slide_row['dir']
             save_slide_path = save_sections_path / f"{processing_config['save_initial_dataset_prefix']}{slide_id}.zarr"
             logger.info(f"Processing slide {slide_id}...")
+
+            # Check if already generated
             if is_complete(save_slide_path, check_store=True):
                 logger.info(f"Slide {slide_id} already processed. Skipping.")
                 continue
             logger.info(f"Generating SpatialData object for slide {slide_id}...")
+
+            # Make sure experiment file exists - if not, try to find alternative location
             if not (raw_slide_path / 'experiment.xenium').exists():
                 logger.info(f"Experiment file not found for slide {slide_id} at {raw_slide_path / 'experiment.xenium'}")
                 logger.info(f"Looking for alternative experiment file...")
@@ -87,6 +143,8 @@ def generate_slides(dataset_name: str, config_path: str=None, select_sections: l
                 else:
                     logger.error(f"Could not find experiment file for slide {slide_id}. Skipping.")
                     continue
+
+            # Read Xenium slide and save
             logger.info(f"Reading Xenium bundle: {raw_slide_path}")
             sdata_reader_params = config.get('sdata_reader_params', {})
             if sdata_reader_params.get('n_jobs') == "max": sdata_reader_params['n_jobs'] = os.cpu_count()
