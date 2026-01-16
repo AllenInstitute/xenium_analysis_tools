@@ -15,6 +15,28 @@ from xenium_analysis_tools.utils.io_utils import (
 )
 from xenium_analysis_tools.process_xenium.process_spatialdata import read_xenium_slide
 
+def find_xenium_bundle(bundle_name, data_folder='/root/capsule/data'):
+    data_folder = Path(data_folder)
+    search_paths = [
+        data_folder / 'xenium_data',
+        data_folder / 'Xenium_output_pilot'
+    ]
+    search_paths = [path for path in search_paths if path.exists()]
+    all_dirs = np.concatenate([list(folder.iterdir()) for folder in search_paths])
+    output_folders = np.concatenate([list(folder.glob('output-*')) for folder in search_paths])
+    subfolders = np.setdiff1d(all_dirs, output_folders)
+    path_to_bundle = None
+    found_dirs = [dir for dir in output_folders if dir.name == bundle_name]
+    if found_dirs:
+        path_to_bundle = found_dirs[0]
+    else:
+        for sub in subfolders:
+            found_dirs = [dir for dir in list(sub.iterdir()) if dir.name == bundle_name]
+            if found_dirs:
+                path_to_bundle = found_dirs[0]
+                break
+    return path_to_bundle
+    
 def generate_slides(dataset_name: str, config_path: str=None, select_sections: list[int]|None = None):
     """
     Generate slide-level SpatialData objects from raw Xenium data bundles.
@@ -55,6 +77,16 @@ def generate_slides(dataset_name: str, config_path: str=None, select_sections: l
                 logger.info(f"Slide {slide_id} already processed. Skipping.")
                 continue
             logger.info(f"Generating SpatialData object for slide {slide_id}...")
+            if not (raw_slide_path / 'experiment.xenium').exists():
+                logger.info(f"Experiment file not found for slide {slide_id} at {raw_slide_path / 'experiment.xenium'}")
+                logger.info(f"Looking for alternative experiment file...")
+                path_to_bundle = find_xenium_bundle(slide_row['dir'], data_folder=paths['data_root'])
+                if path_to_bundle is not None:
+                    logger.info(f"Found alternative experiment file in {path_to_bundle.parent}")
+                    raw_slide_path = path_to_bundle
+                else:
+                    logger.error(f"Could not find experiment file for slide {slide_id}. Skipping.")
+                    continue
             logger.info(f"Reading Xenium bundle: {raw_slide_path}")
             sdata_reader_params = config.get('sdata_reader_params', {})
             if sdata_reader_params.get('n_jobs') == "max": sdata_reader_params['n_jobs'] = os.cpu_count()
