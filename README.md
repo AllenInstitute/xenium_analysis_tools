@@ -60,3 +60,5 @@ Shared utility functions used across the library.
 [ ]: Consolidate & add Xenium data QC functions and make new capsule
 
 [ ]: Consolidate & add mapping evaluation/QC functions
+
+[ ]: Add functions for combining alignments
