@@ -4,6 +4,10 @@ A Python library for processing and analyzing Xenium sections, utilizing Spatial
 
 ## Installation
 
+Important dependencies:
+* spatialdata[extra]==0.6.1
+* pyarrow==21.0.0
+
 ### In Code Ocean Package Manager:
 pip: git+[https://github.com/AllenInstitute/xenium_analysis_tools#egg=xenium-analysis-tools]
 * To get updated version of package, need to 'refresh' package image - usually removing and adding again works.
