@@ -109,7 +109,7 @@ def map_sections(dataset_name: str, config_path: str=None, select_sections: list
             v1_types_path = Path(paths['scratch_root']) / v1_types_df_name
         else:
             v1_types_path = None
-        v1_merfish_cells = get_v1_merfish_cells(abc_cache, output_path=v1_types_path)
+        v1_merfish_cells = get_v1_merfish_cells(abc_cache, df_path=v1_types_path)
         v1_nodes_to_drop = get_nodes_to_drop(v1_merfish_cells, abc_cache, h_level=h_level, min_cells=min_cells)
         logger.info(f"Dropping {len(v1_nodes_to_drop)} {h_level} nodes not present in V1 MERFISH data with at least {min_cells} cells.")
         nodes_to_drop.extend(v1_nodes_to_drop)
