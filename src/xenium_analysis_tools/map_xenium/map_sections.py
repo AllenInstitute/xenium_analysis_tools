@@ -46,12 +46,14 @@ def get_sections_to_process(sections_path, select_sections=None):
     
     return sorted(selected_zarrs, key=lambda p: int(p.stem.split('_')[-1]))
     
-def get_v1_merfish_subclasses(abc_cache, output_path=None, visp_cluster_min_cells=0):
+def get_v1_merfish_cells(abc_cache=None, output_path=None):
     if output_path and output_path.exists():
         v1_merfish_cells = pd.read_csv(output_path, index_col=0)
     else:
         # Get MERFISH CCF metadata
         print('V1 cell df not found, generating new one...')
+        if abc_cache is None:
+            raise ValueError("abc_cache must be provided if output_path does not exist")
         merfish_ccf_metadata = abc_cache.get_metadata_dataframe(
                     directory='MERFISH-C57BL6J-638850-CCF', 
                     file_name='cell_metadata_with_parcellation_annotation'
@@ -59,17 +61,26 @@ def get_v1_merfish_subclasses(abc_cache, output_path=None, visp_cluster_min_cell
         v1_merfish_cells = merfish_ccf_metadata.loc[merfish_ccf_metadata['parcellation_structure']=='VISp']
         if output_path:
             v1_merfish_cells.to_csv(output_path)
+    return v1_merfish_cells
 
+def get_nodes_to_drop(cells_df, abc_cache, h_level='subclass', min_cells=0):
     # Load the taxonomy
     taxonomy_df = abc_cache.get_metadata_dataframe(
                         directory='WMB-taxonomy',
                         file_name='cluster_to_cluster_annotation_membership'
                     )
-    v1_subclasses = v1_merfish_cells.groupby('subclass').size()
-    v1_subclasses = v1_subclasses[v1_subclasses>=visp_cluster_min_cells].index.tolist()
-    valid_subclasses = [np.unique(taxonomy_df.loc[taxonomy_df['cluster_annotation_term_name']==subcl,'cluster_annotation_term_label'])[0] for subcl in v1_subclasses]
-    subclasses_to_drop = np.setdiff1d(taxonomy_df.loc[taxonomy_df['cluster_annotation_term_set_name']=='subclass','cluster_annotation_term_label'].unique(), valid_subclasses)
-    nodes_to_drop = [('subclass', cl) for cl in subclasses_to_drop]
+    # Group the cells by the specified hierarchy level
+    grouped_cells = cells_df.groupby(h_level).size()
+
+    # Identify clusters below the minimum cell threshold
+    filtered_clusters = grouped_cells[grouped_cells>=min_cells].index.tolist()
+
+    # Get the valid clusters from the taxonomy
+    valid_clusters = [np.unique(taxonomy_df.loc[taxonomy_df['cluster_annotation_term_name']==cl,'cluster_annotation_term_label'])[0] for cl in filtered_clusters]
+
+    # Determine nodes to drop
+    clusters_to_drop = np.setdiff1d(taxonomy_df.loc[taxonomy_df['cluster_annotation_term_set_name']==h_level,'cluster_annotation_term_label'].unique(), valid_clusters)
+    nodes_to_drop = [(h_level, cl) for cl in clusters_to_drop]
     return nodes_to_drop
 
 def get_abc_paths(abc_cache):
@@ -140,105 +151,208 @@ def generate_section_h5ad(data_path, save_path, var_filters=None, obs_filters=No
     adata.write_h5ad(save_path)
     return save_path
 
+def setup_paths_and_names(section_path, save_results_path, mapping_config):
+    """Set up paths and naming conventions for a section."""
+    section_name = section_path.stem
+
+    # Naming conventions from mapping config
+    input_data_folder_name = mapping_config.get('input_data_folder_name', 'input_data')
+    mapped_data_folder_name = mapping_config.get('mapped_data_folder_name', 'mapped_data')
+    input_h5ad_name = mapping_config.get('input_h5ad_name', 'input_cellxgene.h5ad')
+    mapped_data_h5ad_name = mapping_config.get('mapped_data_h5ad_name', 'mapped_cellxgene.h5ad')
+    basic_results_name = mapping_config.get('basic_results_name', 'basic_results.csv')
+    extended_results_name = mapping_config.get('extended_results_name', 'extended_results.json')
+
+    # Set up paths
+    input_data_folder = save_results_path / section_name / input_data_folder_name
+    input_data_folder.mkdir(parents=True, exist_ok=True)
+
+    # Path to table AnnData
+    table_path = section_path / 'tables' / 'table'
+    cellxgene_input_path = input_data_folder / input_h5ad_name
+
+    # Section output folder
+    output_data_folder = save_results_path / section_name / mapped_data_folder_name
+    output_data_folder.mkdir(parents=True, exist_ok=True)
+
+    # Output paths
+    extended_results_path = output_data_folder / extended_results_name
+    basic_results_path = output_data_folder / basic_results_name
+    mapped_adata_path = output_data_folder / mapped_data_h5ad_name
+    section_save_path = save_results_path / f"{section_name}.h5ad"
+
+    return (table_path, input_data_folder, cellxgene_input_path, output_data_folder,
+            extended_results_path, basic_results_path,
+            mapped_adata_path, section_save_path)
+
+def get_overwrite_flags(mapping_config):
+    overwrite_all_steps = mapping_config.get('overwrite_all_steps', False)
+    overwrite_input_data = mapping_config.get('overwrite_input_data', False)
+    overwrite_running_mapping = mapping_config.get('overwrite_running_mapping', False)
+    overwrite_formatting = mapping_config.get('overwrite_formatting', False)
+    overwrite_merge = mapping_config.get('overwrite_merge', False)
+    overwrite_any = any([overwrite_all_steps, overwrite_input_data, overwrite_running_mapping, overwrite_formatting, overwrite_merge])
+    return overwrite_any, overwrite_all_steps, overwrite_input_data, overwrite_running_mapping, overwrite_formatting, overwrite_merge
+
+def validate_input_adata(h5ad_path, output_dir, mouse_markers_path, db_path, round_to_int=False, layer='X', output_json=None):
+    if output_json is None:
+        output_json = tempfile.mkstemp(suffix='.json')[1]
+    validate_config = {
+        'h5ad_path': str(h5ad_path),
+        'round_to_int': round_to_int,
+        'layer': layer,
+        'output_dir': str(output_dir),
+        'output_json': output_json,
+        'gene_mapping': {'db_path': db_path}
+    }
+    try:
+        print("Starting validation of input data...")
+        validation_runner = ValidateH5adRunner(args=[], input_data=validate_config)
+        validation_runner.run()
+        validated_path = json.load(open(validate_config['output_json'], 'rb'))['valid_h5ad_path']
+        markers_json = json.load(open(mouse_markers_path, 'rb'))
+        markers = []
+        for key in list(markers_json.keys())[:-2]:
+            markers += markers_json[key]
+        use_validated_h5ad = any('ENSMUSG' in marker for marker in markers)
+        if use_validated_h5ad:
+            print(f"Using validated path: {validated_path}")
+            return validated_path
+        else:
+            print(f'Using original path: {h5ad_path}')
+            return h5ad_path
+    except Exception as e:
+        print(f"Validation failed: {e}")
+        raise e
+
+def format_mapping_outputs(extended_results_path, mapped_adata_path, mapping_params, h5ad_path=None):
+    try:
+        if h5ad_path is None:
+            with open(extended_results_path, 'r') as f:
+                extended_results = json.load(f)
+            h5ad_path = extended_results['config']['query_path']
+        ad_config = {
+            'h5ad_path': str(h5ad_path), 
+            'result_path': str(extended_results_path), 
+            'new_h5ad_path': str(mapped_adata_path),
+            'clobber': bool(mapping_params['clobber'])
+        }
+        TranscribeToObsRunner(args=[], input_data=ad_config).run()
+        return True
+    except Exception as e:
+        print(f"Formatting mapping outputs failed: {e}")
+        return False
+
+def merge_mapping_to_table(mapped_adata_path, table_path, section_save_path):
+    # Read in the mapped AnnData
+    mapped_adata = ad.read_h5ad(mapped_adata_path)
+    mapped_adata.obs.columns = mapped_adata.obs.columns.str.replace('CDM_', "")
+
+    # Clean up column names
+    mapped_adata.obs.rename(
+        columns={col: col.replace(" (non-expanded)", "") for col in mapped_adata.obs.columns}, 
+        inplace=True
+    )
+    name_cols = [col for col in mapped_adata.obs.columns if col.endswith('_name')]
+    
+    # Check first name_cols to see if all NaNs (ie mapping failed)
+    if name_cols:
+        first_name_col = name_cols[0]
+        if mapped_adata.obs[first_name_col].isna().all():
+            print(f"All values in {first_name_col} are NaN, indicating mapping may have failed for {section_name}.")
+            return False
+    else:
+        print(f"No name columns found in mapped AnnData indicating mapping may have failed for {section_name}.")
+        return False
+
+    # Load original section SpatialData table
+    section_sd_table = ad.io.read_zarr(table_path)
+    orig_table_shape = section_sd_table.shape
+    print(f"Original table: \n\t{section_sd_table.n_obs} cells \n\t{section_sd_table.n_vars} genes")
+    print(f"Mapped adata: \n\t{mapped_adata.n_obs} cells \n\t{mapped_adata.n_vars} genes")
+
+    # Update obs
+    mapping_obs_cols = [col for col in mapped_adata.obs.columns if col not in section_sd_table.obs.columns]
+    print(f"Adding {len(mapping_obs_cols)} columns to obs.")
+    section_sd_table.obs = section_sd_table.obs.merge(
+        mapped_adata.obs[mapping_obs_cols], 
+        left_index=True, 
+        right_index=True, 
+        how='left', 
+        suffixes=('', '_mapped')
+    )
+
+    # Update vars
+    mapping_var_cols = [col for col in mapped_adata.var.columns if col not in section_sd_table.var.columns]
+    if mapping_var_cols:
+        print(f"Adding {len(mapping_var_cols)} columns to var.")
+    section_sd_table.var = section_sd_table.var.merge(
+        mapped_adata.var[mapping_var_cols], 
+        left_index=True, 
+        right_index=True, 
+        how='left', 
+        suffixes=('', '_mapped')
+    )
+    print(f"Original table shape: {orig_table_shape}")
+    print(f"Updated table shape: {section_sd_table.shape}")
+
+    # Save merged table as h5ad
+    section_sd_table.write_h5ad(section_save_path)
+    
+    del mapped_adata, section_sd_table
+    gc.collect()
+    return True 
+
 def map_single_section(section_path, logger, save_results_path, 
                    mapping_config, mapping_params, type_assignment,
                    precomputed_stats_path, mouse_markers_path, gene_mapper_db_path,
                    var_filters, obs_filters):
     """Process a single section."""
+
+    # Set up paths and names
     section_name = section_path.stem
+    (table_path, input_data_folder, cellxgene_input_path, output_data_folder,
+     extended_results_path, basic_results_path,
+     mapped_adata_path, section_save_path) = setup_paths_and_names(
+        section_path, save_results_path, mapping_config
+    )
     
-    # Set up paths
-    input_data_folder = save_results_path / section_name / 'input_data'
-    input_data_folder.mkdir(parents=True, exist_ok=True)
-
-    # Path to table AnnData
-    table_path = section_path / 'tables' / 'table'
-    cellxgene_input_path = input_data_folder / 'input_cellxgene.h5ad'
-
-    # Section output folder
-    output_data_folder = save_results_path / section_name / 'mapped_data'
-    output_data_folder.mkdir(parents=True, exist_ok=True)
-
-    # Output paths
-    extended_results_path = output_data_folder / 'extended_results.json'
-    basic_results_path = output_data_folder / 'basic_results.csv'
-    mapped_adata_path = output_data_folder / 'mapped_cellxgene.h5ad'
-
-    # Full updated Table AnnData path (will be all cells in SpatialData object, not just mapped)
-    section_save_path = save_results_path / f"{section_name}.h5ad"
+    # Determine overwrite flags
+    (overwrite_any, overwrite_all_steps, overwrite_input_data, 
+     overwrite_running_mapping, overwrite_formatting, overwrite_merge) = get_overwrite_flags(mapping_config)
 
     # Check if section already mapped and if any overwrite flags are set
-    if section_save_path.exists() and not np.any([mapping_params.get('overwrite_all_steps', False),
-                                                    mapping_params.get('overwrite_input_data', False),
-                                                    mapping_params.get('overwrite_running_mapping', False),
-                                                    mapping_params.get('overwrite_final_output', False)]):
+    if section_save_path.exists() and not overwrite_any:
         logger.info(f"{section_name} already mapped, skipping.")
         return True
     else:
         logger.info(f"Mapping {section_name}...")
 
     # ----- Generate cellxgene input h5ad -----
-    if cellxgene_input_path.exists() and not mapping_params.get('overwrite_input_data', False):
+    if cellxgene_input_path.exists() and not overwrite_input_data:
         logger.info(f"Cellxgene input h5ad already exists at {cellxgene_input_path}, skipping generation.")
     else:
-        cellxgene_input_path = generate_section_h5ad(data_path=table_path, save_path=cellxgene_input_path, var_filters=var_filters, obs_filters=obs_filters)
+        cellxgene_input_path = generate_section_h5ad(data_path=table_path, 
+                                    save_path=cellxgene_input_path, 
+                                    var_filters=var_filters, 
+                                    obs_filters=obs_filters)
 
     # ----- Map types -----
-    if extended_results_path.exists() and basic_results_path.exists() and not mapping_params.get('overwrite_running_mapping', False):
-        logger.info(f"Already ran mapping for section, skipping.")
+    if extended_results_path.exists() and basic_results_path.exists() and not overwrite_running_mapping:
+        logger.info(f"Already ran mapping for section")
+        query_path = None
     else:
         logger.info(f"Starting mapping process for {section_name}")
-        
-        path_h5ad = str(cellxgene_input_path)
-        # Safer way to get log path if needed
-        log_path = None
-        for handler in logger.handlers:
-            if hasattr(handler, 'baseFilename'):
-                log_path = str(handler.baseFilename)
-                break
-        
-        validate_config = {
-            'h5ad_path': str(cellxgene_input_path),
-            'round_to_int': False,
-            'layer': 'X',
-            'output_dir': str(input_data_folder),
-            'output_json': tempfile.mkstemp(suffix='.json')[1],
-            'gene_mapping': {'db_path': gene_mapper_db_path}
-        }
-        
-        # Only add log_path if we found one
-        if log_path:
-            validate_config['log_path'] = log_path
-
         # Validate input data before running mapper
         if mapping_config.get('validate_input', False):
-            logger.info("Starting validation of input h5ad...")
-            try:
-                validation_runner = ValidateH5adRunner(args=[], input_data=validate_config)
-                validation_runner.run()
-                logger.info("Validation completed successfully")
-                
-                validated_path = json.load(open(validate_config['output_json'], 'rb'))['valid_h5ad_path']
-                markers_json = json.load(open(mouse_markers_path, 'rb'))
-                markers = []
-                for key in list(markers_json.keys())[:-2]:
-                    markers += markers_json[key]
-                use_validated_h5ad = any('ENSMUSG' in marker for marker in markers)
-                if use_validated_h5ad:
-                    logger.info(f"Using validated path: {validated_path}")
-                    path_h5ad = validated_path
-                else:
-                    logger.info(f'Using original path: {path_h5ad}')
-                    
-            except Exception as e:
-                logger.error(f"Validation failed: {e}")
-                raise e
+            query_path = validate_input_adata(cellxgene_input_path, input_data_folder, mouse_markers_path, gene_mapper_db_path)
         else:
-            logger.info("Skipping input validation")
+            logger.info("Not validating input data before mapping")
+            query_path = cellxgene_input_path
 
         # Set up the mapping runner
         mapper_config = {
-            'query_path': path_h5ad,
+            'query_path': query_path,
             'extended_result_path': str(extended_results_path),
             'csv_result_path': str(basic_results_path),
             'flatten': True if mapping_params.get('mapping_type') == 'flat' else False,
@@ -253,123 +367,35 @@ def map_single_section(section_path, logger, save_results_path,
         
         logger.info("Mapping configuration prepared")
         logger.info(f"Query path: {mapper_config['query_path']}")
-        logger.info(f"Output paths - Extended: {extended_results_path}, Basic: {basic_results_path}")
+        logger.info(f"Output paths: \n\tExtended: {extended_results_path}, \n\tBasic: {basic_results_path}")
 
         # Run the mapper
         logger.info(f"Starting cell type mapping for {section_name}...")
         try:
             runner = FromSpecifiedMarkersRunner(args=[], input_data=mapper_config)
             runner.run()
-            logger.info(f"Mapping completed successfully for {section_name}")
+            logger.info(f"Mapping completed for {section_name}")
         except Exception as e:
             logger.error(f"Mapping failed for {section_name}: {e}")
-            raise e
+            return False
 
     # ----- Format output data -----
-    logger.info(f"Starting output formatting for {section_name}")
-    if mapped_adata_path.exists() and not mapping_params.get('overwrite_final_output', False):
-        logger.info(f"AnnData for mapping results already exists at {mapped_adata_path}, skipping generation.")
+    if mapped_adata_path.exists() and not overwrite_formatting:
+        logger.info(f"Formatted AnnData already exists at {mapped_adata_path}, skipping generation.")
     else:
-        logger.info(f"Generating mapped h5ad: {mapped_adata_path}")
-        try:
-            # Generate h5ad version of mapping outputs
-            ad_config = {
-                    'result_path': str(extended_results_path), 
-                    'h5ad_path': str(path_h5ad), 
-                    'new_h5ad_path': str(mapped_adata_path),
-                    'clobber': bool(mapping_params['clobber'])
-                }
-            TranscribeToObsRunner(args=[], input_data=ad_config).run()
-            logger.info(f"Output formatting completed for {section_name}")
-        except Exception as e:
-            logger.error(f"Output formatting failed for {section_name}: {e}")
-            raise e
-
-    # ----- Final mapping output formatting/merging -----
-    if not mapped_adata_path.exists():
-        raise FileNotFoundError(f"Mapped AnnData file not found at {mapped_adata_path} - mapping may have failed.")
-    mapped_adata = ad.read_h5ad(mapped_adata_path)
-
-    # Clean up column names
-    mapped_adata.obs.columns = mapped_adata.obs.columns.str.replace('CDM_', "")
-    mapped_adata.obs.rename(
-        columns={col: col.replace(" (non-expanded)", "") for col in mapped_adata.obs.columns}, 
-        inplace=True
-    )
-    name_cols = [col for col in mapped_adata.obs.columns if col.endswith('_name')]
-    numeric_cols = [col for col in mapped_adata.obs.columns if col.endswith('_probability') or col.endswith('_correlation')]
-
-    # Check first name_cols to see if all NaNs (ie mapping failed)
-    if name_cols:
-        first_name_col = name_cols[0]
-        if mapped_adata.obs[first_name_col].isna().all():
-            logger.warning(f"All values in {first_name_col} are NaN, indicating mapping may have failed for {section_name}.")
-            print(f"✗ {section_name} failed: All mapped names are NaN")
+        logger.info(f"Generating formatted AnnData: {mapped_adata_path}")
+        format_out = format_mapping_outputs(extended_results_path, mapped_adata_path, mapping_params, h5ad_path=query_path)
+        if not format_out:
+            logger.error(f"Formatting mapping outputs failed for {section_name}")
             return False
-    else:
-        logger.warning(f"No name columns found in mapped AnnData indicating mapping may have failed for {section_name}.")
-        print(f"✗ {section_name} failed: No name columns found")
-        return False
-
-    # Section mapping summary
-    if name_cols:
-        name_summary = pd.DataFrame({
-            'count': mapped_adata.obs[name_cols].count(),
-            'nunique': mapped_adata.obs[name_cols].nunique(),
-            'most_frequent': mapped_adata.obs[name_cols].mode().iloc[0] if len(mapped_adata.obs) > 0 else None,
-            'frequency': [mapped_adata.obs[col].value_counts().iloc[0] if len(mapped_adata.obs[col].value_counts()) > 0 else 0 for col in name_cols]
-        })
-        print("Name Columns Summary:")
-        print(name_summary)
-        print("\n")
-        logger.info(f"Name Columns Summary:\n{name_summary}\n")
-    if numeric_cols:
-        numeric_summary = pd.DataFrame({
-            'count': mapped_adata.obs[numeric_cols].count(),
-            'mean': mapped_adata.obs[numeric_cols].mean(),
-            'min': mapped_adata.obs[numeric_cols].min(),
-            'max': mapped_adata.obs[numeric_cols].max()
-        })
-        print("Numeric Columns Summary:")
-        print(numeric_summary)
-        logger.info(f"Numeric Columns Summary:\n{numeric_summary}\n")
-
-
+    
     # ----- Merge mapping results back into original SpatialData table -----
-    # Load original section SpatialData table
-    section_sd_table = ad.io.read_zarr(table_path)
-    orig_table_shape = section_sd_table.shape
-    logger.info(f"Original table: \n\t{section_sd_table.n_obs} cells \n\t{section_sd_table.n_vars} genes")
-    logger.info(f"Mapped adata: \n\t{mapped_adata.n_obs} cells \n\t{mapped_adata.n_vars} genes")
-
-    # Update obs
-    mapping_obs_cols = [col for col in mapped_adata.obs.columns if col not in section_sd_table.obs.columns]
-    logger.info(f"Adding {len(mapping_obs_cols)} columns to obs.")
-    section_sd_table.obs = section_sd_table.obs.merge(
-        mapped_adata.obs[mapping_obs_cols], 
-        left_index=True, 
-        right_index=True, 
-        how='left', 
-        suffixes=('', '_mapped')
-    )
-    # Update vars
-    mapping_var_cols = [col for col in mapped_adata.var.columns if col not in section_sd_table.var.columns]
-    if mapping_var_cols:
-        logger.info(f"Adding {len(mapping_var_cols)} columns to var.")
-    section_sd_table.var = section_sd_table.var.merge(
-        mapped_adata.var[mapping_var_cols], 
-        left_index=True, 
-        right_index=True, 
-        how='left', 
-        suffixes=('', '_mapped')
-    )
-    logger.info(f"Original table shape: {orig_table_shape}")
-    logger.info(f"Updated table shape: {section_sd_table.shape}")
-
-    section_sd_table.write_h5ad(section_save_path)
-    
-    del mapped_adata, section_sd_table
-    gc.collect()
-    
-    print(f"{section_name} completed successfully")
-    return True 
+    if section_save_path.exists() and not overwrite_merge:
+        logger.info(f"Formatted AnnData already exists at {mapped_adata_path}, skipping generation.")
+    else:
+        logger.info(f"Merging mapping results back into original table for {section_name}")
+        merged_to_table = merge_mapping_to_table(mapped_adata_path, table_path, section_save_path)
+        if not merged_to_table:
+            logger.error(f"Merging mapping results failed for {section_name}")
+            return False
+    return True

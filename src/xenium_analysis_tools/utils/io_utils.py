@@ -166,7 +166,7 @@ def find_xenium_bundle(bundle_name, data_folder='/root/capsule/data'):
                 break
     return path_to_bundle
 
-def get_partial_dataset(source_path, dest_path, pattern='section_*', subset_ids=None):
+def get_partial_dataset(source_path, dest_path, pattern='section_*', subset_ids=None, is_complete_func=is_complete_store, func_args=None):
     """Copy slide data from source to destination, handling incomplete files."""
     # Find matches
     all_matches = list(source_path.glob(pattern))
@@ -191,21 +191,66 @@ def get_partial_dataset(source_path, dest_path, pattern='section_*', subset_ids=
     # Copy slides
     for ma in matches:
         print(f"Checking {ma.name}...")
-        dest_slide = dest_path / ma.name
+        dest_dir = dest_path / ma.name
 
         # Skip if destination already complete
-        if dest_slide.exists() and is_complete_store(dest_slide):
+        if dest_dir.exists() and is_complete_func(dest_dir, args=func_args):
             print(f"{ma.name} already complete")
             continue
         
         # Only copy if source is valid
-        if not is_complete_store(ma):
+        if not is_complete_func(ma, args=func_args):
             print(f"{ma.name} source incomplete, skipping")
             continue
         
         # Remove incomplete destination and copy
-        if dest_slide.exists():
-            rmtree(dest_slide)
-
-        copytree(ma, dest_slide)
+        if dest_dir.exists():
+            if dest_dir.is_file():
+                dest_dir.unlink()
+            elif dest_dir.is_dir():
+                rmtree(dest_dir)
+            else:
+                print(f"Unknown file type at destination: {dest_dir}, skipping copy")
+                continue
+        
+        if ma.is_file():
+            # Copy file
+            dest_dir.parent.mkdir(parents=True, exist_ok=True)
+            dest_dir.write_bytes(ma.read_bytes())
+        elif ma.is_dir():
+            # Copy directory
+            copytree(ma, dest_dir)
+        else:
+            print(f"Unknown file type at source: {ma}, skipping copy")
+            continue
         print(f"Copied {ma.name}")
+
+def is_complete_mapping_results(path_str, args=None):
+    path = Path(path_str)
+
+    if path.name.endswith('.h5ad'):
+        return path.exists()
+    elif path.is_dir():
+        input_folder_name = args.get('input_folder_name', 'input_data')
+        mapped_folder_name = args.get('mapped_folder_name', 'mapped_data')
+        # Should have input_data and mapped_data folders
+        expected_folders = [input_folder_name, mapped_folder_name]
+        for ef in expected_folders:
+            if not (path / ef).exists():
+                return False
+
+        # Check input files
+        input_data_files = args.get('input_data_files', ['input_cellxgene.h5ad'])
+        for infile in input_data_files:
+            if not (path / input_folder_name / infile).exists():
+                return False
+
+        # Check mapped files
+        mapped_data_files = args.get('mapped_data_files', ['basic_results.csv',
+                                                             'extended_results.json',
+                                                             'mapped_cellxgene.h5ad'])
+        for mfile in mapped_data_files:
+            if not (path / mapped_folder_name / mfile).exists():
+                return False
+
+        return True
