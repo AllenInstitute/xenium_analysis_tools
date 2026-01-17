@@ -60,6 +60,7 @@ def get_v1_merfish_cells(abc_cache=None, output_path=None):
                 ).set_index('cell_label')
         v1_merfish_cells = merfish_ccf_metadata.loc[merfish_ccf_metadata['parcellation_structure']=='VISp']
         if output_path:
+            print(f'Saving df to: {output_path}")
             v1_merfish_cells.to_csv(output_path)
     return v1_merfish_cells
 
