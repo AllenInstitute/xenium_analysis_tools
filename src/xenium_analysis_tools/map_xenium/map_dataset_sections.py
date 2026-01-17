@@ -104,7 +104,7 @@ def map_sections(dataset_name: str, config_path: str=None, select_sections: list
     if filter_v1_types_config and filter_v1_types_config.get('enabled', False):
         h_level = filter_v1_types_config.get('h_level', 'subclass')
         min_cells = filter_v1_types_config.get('min_cells', 0)
-        v1_types_df_name = filter_v1_types_config.get('saved_df_name', None)
+        v1_types_df_name = filter_v1_types_config.get('saved_df_name', 'v1_merfish_cells.csv')
         if v1_types_df_name:
             v1_types_path = Path(paths['scratch_root']) / v1_types_df_name
         else:
