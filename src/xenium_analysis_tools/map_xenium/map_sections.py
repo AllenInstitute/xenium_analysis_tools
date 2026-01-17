@@ -46,9 +46,9 @@ def get_sections_to_process(sections_path, select_sections=None):
     
     return sorted(selected_zarrs, key=lambda p: int(p.stem.split('_')[-1]))
     
-def get_v1_merfish_cells(abc_cache=None, output_path=None):
-    if output_path and output_path.exists():
-        v1_merfish_cells = pd.read_csv(output_path, index_col=0)
+def get_v1_merfish_cells(abc_cache=None, df_path=None):
+    if df_path and df_path.exists():
+        v1_merfish_cells = pd.read_csv(df_path, index_col=0)
     else:
         # Get MERFISH CCF metadata
         print('V1 cell df not found, generating new one...')
@@ -59,9 +59,9 @@ def get_v1_merfish_cells(abc_cache=None, output_path=None):
                     file_name='cell_metadata_with_parcellation_annotation'
                 ).set_index('cell_label')
         v1_merfish_cells = merfish_ccf_metadata.loc[merfish_ccf_metadata['parcellation_structure']=='VISp']
-        if output_path:
-            print(f'Saving df to: {output_path}")
-            v1_merfish_cells.to_csv(output_path)
+        # Save created df
+        print(f"Saving df to: {df_path}")
+        v1_merfish_cells.to_csv(output_path)
     return v1_merfish_cells
 
 def get_nodes_to_drop(cells_df, abc_cache, h_level='subclass', min_cells=0):
