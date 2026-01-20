@@ -93,13 +93,13 @@ def crop_filter_sdata(sdata, bbox, c_system='global', crop_transcripts_separatel
                 # Ensure clean index after filtering
                 filtered_transcripts = filtered_transcripts.reset_index(drop=True)
                 cropped_sdata.points['transcripts'] = sd.models.PointsModel.parse(filtered_transcripts)
-        else:
-            cropped_sdata = sdata.query.bounding_box(
-                axes=('y', 'x'),
-                min_coordinate=[bbox['y_min'], bbox['x_min']],
-                max_coordinate=[bbox['y_max'], bbox['x_max']],
-                target_coordinate_system=c_system
-            )
+    else:
+        cropped_sdata = sdata.query.bounding_box(
+            axes=('y', 'x'),
+            min_coordinate=[bbox['y_min'], bbox['x_min']],
+            max_coordinate=[bbox['y_max'], bbox['x_max']],
+            target_coordinate_system=c_system
+        )
     return cropped_sdata
 
 def crop_dapi_image(dapi_image, bbox):
