@@ -28,21 +28,19 @@ def add_micron_coord_sys(sdata, pixel_size=None, z_step=None):
     identity = Identity()
 
     # --- Images ---
-    # dapi_zstack is (c, z, y, x)
-    if 'dapi_zstack' in sdata.images:
-        set_transformation(
-            sdata.images['dapi_zstack'], 
-            scale_czyx, 
-            to_coordinate_system="microns"
-        )
-
-    # morphology_focus is (c, y, x)
-    if 'morphology_focus' in sdata.images:
-        set_transformation(
-            sdata.images['morphology_focus'], 
-            scale_cyx, 
-            to_coordinate_system="microns"
-        )
+    for image_name in sdata.images:
+        if 'z' in sdata[image_name].dims:
+            set_transformation(
+                sdata.images[image_name], 
+                scale_czyx, 
+                to_coordinate_system="microns"
+            )
+        else:
+            set_transformation(
+                sdata.images[image_name], 
+                scale_cyx, 
+                to_coordinate_system="microns"
+            )
 
     # --- Labels ---
     # Both labels are (y, x)
