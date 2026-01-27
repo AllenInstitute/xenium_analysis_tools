@@ -182,7 +182,7 @@ def get_alignment_data_paths(dataset_id,
     
     return paths
 
-def get_zstack_sdata(stack, stack_masks=None, use_shared_coords=True):
+def get_zstack_sdata(stack, zstack_masks=None, use_shared_coords=True):
     # Create the z-stack image array
     num_channels = len(stack['stack_channels'])
     chans = []
@@ -223,14 +223,14 @@ def get_zstack_sdata(stack, stack_masks=None, use_shared_coords=True):
             images={'zstack': zstack_img},
         )
 
-    if stack_masks is not None:
+    if zstack_masks is not None:
         # Get labels for each channel
         for mask_ind, masks in zstack_masks['channel_tifs'].items():
             channel_name = zstack_masks['stack_channels'][mask_ind]
             zstack_label = create_zstack_array(tif_path=masks['chan_tif_path'], 
-                        fov_x_um=stack_masks['stack_size']['width'], 
-                        fov_y_um=stack_masks['stack_size']['height'], 
-                        fov_z_um=stack_masks['stack_size']['depth'],
+                        fov_x_um=zstack_masks['stack_size']['width'], 
+                        fov_y_um=zstack_masks['stack_size']['height'], 
+                        fov_z_um=zstack_masks['stack_size']['depth'],
                         add_chan=False)
 
             if use_shared_coords:   
