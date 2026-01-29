@@ -1,6 +1,9 @@
 import spatialdata as sd
 from xenium_analysis_tools.utils.sd_utils import add_micron_coord_sys
-from spatialdata.models import Image3DModel, Labels3DModel, PointsModel
+from spatialdata.models import Image2DModel, Image3DModel, Labels3DModel, Labels2DModel, PointsModel, ShapesModel, TableModel
+from spatialdata.transformations import get_transformation, set_transformation
+import anndata as ad
+from spatialdata import get_element_instances
 from pathlib import Path
 import pandas as pd
 import numpy as np
@@ -173,6 +176,7 @@ def get_alignment_data_paths(dataset_id,
         "data_root": data_root,
         "scratch_root": scratch_root,
         "results_root": results_root,
+        "xenium_dataset_name": dataset_config["xenium_name"],
         "sdata_path": data_root / f'{dataset_config["xenium_name"]}_processed',
         "confocal_path": data_root / dataset_config["confocal_name"],
         "zstack_path": data_root / dataset_config["zstack_name"],
@@ -187,9 +191,9 @@ def get_label_params(label_obj, id_name='cell'):
     props = regionprops(labels)
     data = [
         {f'{id_name}_id': p.label, 
-        'z': p.centroid[0], 
-        'y': p.centroid[1], 
-        'x': p.centroid[2],
+        'z': p.centroid[0] if len(p.centroid)==3 else None,
+        'y': p.centroid[1] if len(p.centroid)==3 else p.centroid[0],
+        'x': p.centroid[2] if len(p.centroid)==3 else p.centroid[1],
         'area': p.area,
         'bbox': p.bbox}
         for p in props
@@ -197,33 +201,21 @@ def get_label_params(label_obj, id_name='cell'):
     df = pd.DataFrame(data)
     return df
 
-def get_zstack_sdata(stack, zstack_masks=None, get_centroids_as_points=True):
+def get_zstack_sdata(stack, zstack_masks=None):
     # Create the z-stack image array
-    num_channels = len(stack['zstack_channels'])
-    chans = []
-    if num_channels > 1:
-        for ch_ind in range(num_channels):
-            chan_array = create_zstack_array(tif_path=stack['channel_tifs'][ch_ind]['chan_tif_path'], 
+    chan_arrays = {}
+    for ch_ind, chan_name in enumerate(stack['zstack_channels']):
+        chan_img = create_zstack_array(tif_path=stack['channel_tifs'][ch_ind]['chan_tif_path'], 
                     fov_x_um=stack['zstack_size']['width'], 
                     fov_y_um=stack['zstack_size']['height'], 
                     fov_z_um=stack['zstack_size']['depth'])
-            chans.append(chan_array)
-        zstack_img = xr.concat(chans, dim='c')
-        zstack_img['c'] = stack['zstack_channels']
-    else:
-        zstack_img = create_zstack_array(tif_path=stack['channel_tifs'][0]['chan_tif_path'], 
-                    fov_x_um=stack['zstack_size']['width'], 
-                    fov_y_um=stack['zstack_size']['height'], 
-                    fov_z_um=stack['zstack_size']['depth'])
-        zstack_img['c'] = stack['zstack_channels']
-
-    # Parse into Image3DModel
-    zstack_img = Image3DModel.parse(
-                zstack_img,
+        chan_img = Image3DModel.parse(
+                chan_img,
                 dims=['c', 'z', 'y', 'x'],
-                c_coords=stack['zstack_channels'],
+                c_coords=chan_name,
                 chunks='auto',
             )
+        chan_arrays[chan_name] = chan_img
 
     if zstack_masks is not None:
         zstack_labels = {}
@@ -242,28 +234,32 @@ def get_zstack_sdata(stack, zstack_masks=None, get_centroids_as_points=True):
                         chunks='auto',
                     )
             zstack_labels[f"{channel_name}_labels"] = zstack_label
-
-        if get_centroids_as_points:
-            zstack_points = {}
-            # Get label parameters  add as points
-            for label_name, labels_obj in zstack_labels.items():
-                chan_name = label_name.replace('_labels','')
-                cells_df = get_label_params(labels_obj, id_name=chan_name)
-                print(f"# {chan_name} segmented cells: {len(cells_df)}")
-                cells_df = PointsModel.parse(cells_df)
-                zstack_points[f"{chan_name}_cells"] = cells_df
+    
+        tables = {}
+        for label_name, labels_obj in zstack_labels.items():
+            chan_name = label_name.replace('_labels','')
+            label_type_id = f'{chan_name}_id'
+            chan_label_ids = get_element_instances(labels_obj).values
+            obs = pd.DataFrame(chan_label_ids, columns=[label_type_id])
+            cells_df = get_label_params(labels_obj, id_name=chan_name)
+            cells_df['region'] = label_name
+            obs = obs.merge(cells_df, left_on=label_type_id, right_on=chan_name+'_id', how='left')
+            table = ad.AnnData(obs=obs, obsm={'spatial': obs[['z','y','x']].values})
+            table = TableModel.parse(table, region=label_name, region_key='region', instance_key=label_type_id)
+            tables[f'{chan_name}_cells'] = table
 
     # Assemble SpatialData
     zstack_sdata = sd.SpatialData(
-        images={'zstack': zstack_img},
+        images={**chan_arrays},
         labels={**zstack_labels} if zstack_masks is not None else {},
-        points={**zstack_points} if (zstack_masks is not None and get_centroids_as_points) else {}
+        tables={**tables} if zstack_masks is not None else {}
     )    
 
     # Determine pixel sizes
-    if zstack_sdata['zstack'].attrs['pixel_size_um_x'] == zstack_sdata['zstack'].attrs['pixel_size_um_y']:
-        pixel_size = zstack_sdata['zstack'].attrs['pixel_size_um_x']
-    if zstack_sdata['zstack'].attrs['fov_um_z']==zstack_sdata['zstack'].shape[1]:
+    zstack_chan = zstack_sdata[stack['zstack_channels'][0]] # Use first channel for pixel size reference
+    if zstack_chan.attrs['pixel_size_um_x'] == zstack_chan.attrs['pixel_size_um_y']:
+        pixel_size = zstack_chan.attrs['pixel_size_um_x']
+    if zstack_chan.attrs['fov_um_z']==zstack_chan.shape[1]:
         z_step_size = 1
 
     # Add micron coordinate system if not already present
@@ -273,3 +269,85 @@ def get_zstack_sdata(stack, zstack_masks=None, get_centroids_as_points=True):
         print("Micron coordinate system already exists")
     return zstack_sdata
 
+def get_alignment_spatial_elements(sdata, scale_from_level=2, channel_names=['dapi', 'boundary', 'rna', 'protein']):
+    # Technically should only need to replace morphology focus transforms, but doing for all elements just in case
+    # For elements, get at a specific scale level (if multi-scale) and set transform to global coordinate system
+    # Images
+    # Dapi z-stack
+    dapi_zstack_level = sdata['dapi_zstack'][f'scale{scale_from_level}'].image
+    dapi_zstack_global_tf = get_transformation(dapi_zstack_level, to_coordinate_system='global')
+    dapi_zstack = Image3DModel.parse(sdata['dapi_zstack'][f'scale{scale_from_level}'].image,
+                                                        dims=['c', 'z', 'y', 'x'],
+                                                        c_coords=['DAPI'],
+                                                        chunks='auto',
+                                                    )
+    set_transformation(dapi_zstack, dapi_zstack_global_tf, to_coordinate_system='global')
+
+    # Morphology focus channels    
+    mf_chans_level = sdata['morphology_focus'][f'scale{scale_from_level}'].image
+    mf_img_global_tf = get_transformation(mf_chans_level, to_coordinate_system='global')
+    chans_arrays = {}
+    for chan_ind, chan in enumerate(channel_names):
+        chan_img = sdata['morphology_focus'][f'scale{scale_from_level}'].image[chan_ind]
+        chan_img = np.expand_dims(chan_img.data, axis=0)
+        chans_arrays[chan] = Image2DModel.parse(chan_img,
+                                                dims=['c', 'y', 'x'],
+                                                c_coords=chan,
+                                                chunks='auto',
+                                            )
+        set_transformation(chans_arrays[chan], mf_img_global_tf, to_coordinate_system='global')
+
+    images = {'dapi_zstack': dapi_zstack, **chans_arrays}
+
+    # Labels
+    cell_labels_level = sdata['cell_labels'][f'scale{scale_from_level}'].image
+    cell_labels_tf = get_transformation(cell_labels_level, to_coordinate_system='global')
+    cell_labels = Labels2DModel.parse(cell_labels_level, dims=['y', 'x'], chunks='auto')
+    set_transformation(cell_labels, cell_labels_tf, to_coordinate_system='global')
+    nucleus_labels_level = sdata['nucleus_labels'][f'scale{scale_from_level}'].image
+    nucleus_labels = Labels2DModel.parse(nucleus_labels_level, dims=['y', 'x'], chunks='auto')
+    set_transformation(nucleus_labels, cell_labels_tf, to_coordinate_system='global')
+
+    labels = {
+        'cell_labels': cell_labels,
+        'nucleus_labels': nucleus_labels,
+    }
+
+    return images, labels
+
+def get_alignment_shapes_tables(sdata, 
+                    transcripts_qv_thresh=20, 
+                    annotate_spatial_elements='cell_boundaries',
+                    cell_id_name='cell_id',
+                    mask_id_name='cell_labels'):
+    # Make cell_id to cell_label mapping dictionary
+    cell_id_label_dict = dict(zip(sdata['table'].obs[cell_id_name].values, sdata['table'].obs[mask_id_name].values))
+    transcripts = sdata['transcripts'].compute()
+    # Drop transcripts not included in counts
+    transcripts = transcripts[transcripts['qv']>=transcripts_qv_thresh]
+    # Add cell_labels to transcripts based on cell_id
+    transcripts[mask_id_name] = transcripts[cell_id_name].map(cell_id_label_dict).fillna(0).astype('int64')
+    # Annotate spatial elements (e.g., cell_boundaries) with cell_labels
+    sdata[annotate_spatial_elements][cell_id_name] = sdata[annotate_spatial_elements].index.values
+    sdata[annotate_spatial_elements][mask_id_name] = sdata[annotate_spatial_elements][cell_id_name].map(cell_id_label_dict).values
+    sdata[annotate_spatial_elements].set_index(mask_id_name, inplace=True, drop=False)
+    # Update annotation regions
+    table = sdata['table'].copy()
+    table.obs['region'] = annotate_spatial_elements
+    table.obs['region'] = pd.Categorical(table.obs['region'])
+    table.uns['spatialdata_attrs'].update({
+        'region_key': 'region',
+        'region': [annotate_spatial_elements],
+        'instance_key': mask_id_name
+    })
+
+    # Parse shapes
+    annotated_shape = ShapesModel.parse(sdata[annotate_spatial_elements])
+    shapes = sdata.shapes
+    shapes[annotate_spatial_elements] = annotated_shape
+    # Parse table
+    table = TableModel.parse(table)
+    # Parse transcripts
+    transcripts = PointsModel.parse(transcripts)
+    
+    return table, transcripts, shapes
