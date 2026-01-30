@@ -351,3 +351,46 @@ def get_alignment_shapes_tables(sdata,
     transcripts = PointsModel.parse(transcripts)
     
     return table, transcripts, shapes
+
+def generate_zstack(zstack_path, zstack_masks_path, zstack_size=None, zstack_ind=None, zstack_channels=None, alignment_folder=None):
+    # Make the dictionary for the available z-stacks
+    zstacks_dict = get_zstacks_dict(zstack_path)
+    zstacks_masks_dict = get_zstacks_dict(zstack_masks_path)
+    print(f'Number of z-stacks found: {len(zstacks_dict)}\n')
+    for stack_ind, stack_info in zstacks_dict.items():
+        print(f"Stack {stack_ind}: {stack_info['zstack_name']}")
+        zstack_width = stack_info['zstack_size']['width']
+        zstack_height = stack_info['zstack_size']['height']
+        zstack_depth = stack_info['zstack_size']['depth']
+        print(f"  Size: {zstack_width} W x {zstack_height} H x {zstack_depth} D")
+        print(f"  Channels: {stack_info['zstack_channels']}\n")
+
+    # Select the zstack that matches the criteria
+    if len(zstacks_dict) == 1:
+        zstack_ind = 0
+        zstack_size = None
+        zstack_channels = None
+    zstack_info = get_zstack(zstacks_dict, zstack_ind=zstack_ind, zstack_size=zstack_size, zstack_channels=zstack_channels)
+    zstack_size = zstack_info['zstack_size']
+    zstack_save_name = f"zstack_{zstack_size['width']}x{zstack_size['height']}x{zstack_size['depth']}.zarr"
+
+    if alignment_folder:
+        zstack_save_path = alignment_folder / zstack_save_name
+        if zstack_save_path.exists():
+            print(f"Zstack already generated at: {zstack_save_path}")
+            return zstack_save_path
+        else:
+            alignment_folder.mkdir(parents=True, exist_ok=True)
+            zstack_masks = get_zstack(zstacks_masks_dict, zstack_size=zstack_size)
+            zstack_sdata = get_zstack_sdata(zstack_info, zstack_masks=zstack_masks)
+            for table_name, table in zstack_sdata.tables.items():
+                table.uns = {'zstack_name': zstack_info['zstack_name']}
+            zstack_sdata.write(zstack_save_path)
+            print(f"Zstack saved at: {zstack_save_path}")
+            return zstack_save_path
+    else:
+        zstack_masks = get_zstack(zstacks_masks_dict, zstack_size=zstack_size)
+        zstack_sdata = get_zstack_sdata(zstack_info, zstack_masks=zstack_masks)
+        for table_name, table in zstack_sdata.tables.items():
+            table.uns = {'zstack_name': zstack_info['zstack_name']}
+        return zstack_sdata
