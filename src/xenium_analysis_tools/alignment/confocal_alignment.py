@@ -16,23 +16,19 @@ import os
 def get_confocal_image_sizes(img_name, cf_raw_path, overlap=0.1):
     confocal_notes = pd.read_csv(cf_raw_path / 'notes.csv')
     capture_name = confocal_notes.loc[confocal_notes['note'] == img_name, 'capture names'].values[0]
-    imgdir_path = cf_raw_path / f"{capture_name}.imgdir"
-    if not imgdir_path.exists():
-        imgdir_path = list(cf_raw_path.glob(f"*{capture_name}*.imgdir"))[0]
-
+    sldy_dir = list(cf_raw_path.glob("*.dir"))[0]
+    imgdir_path = sldy_dir / f"{capture_name}.imgdir"
     sample_npy = list(imgdir_path.glob("ImageData_*.npy"))[0]
     shape = np.load(sample_npy, mmap_mode='r').shape # (Z, Y, X)
-
     yaml_path = imgdir_path / 'StagePositionData.yaml'
+
     with open(yaml_path, 'r') as f:
         stage_data = yaml.safe_load(f)
-    
     coords = np.array(stage_data['StructArrayValues']).reshape(-1, 3)
     step_x = np.abs(np.diff(coords[:, 0]))
     step_x = np.median(step_x[step_x > 1.0])
-    
     phys_x = step_x / (shape[2] * (1 - overlap))
-    
+
     return {
         'sizeZ': shape[0],
         'sizeY': shape[1],
@@ -40,26 +36,8 @@ def get_confocal_image_sizes(img_name, cf_raw_path, overlap=0.1):
         'sizeC': 1, # Confocal captures are usually single channel per dir
         'physical_pixel_size_x': phys_x,
         'physical_pixel_size_y': phys_x, # Typically square
-        'physical_pixel_size_z': 1.0     # Placeholder if not in YAML
+        'physical_pixel_size_z': 1.0 # Placeholder if not in YAML
     }
-
-# def get_confocal_image_sizes(img_name, cf_raw_path):
-#     sld_path = list(cf_raw_path.glob('*.sldy'))[0]
-#     r = Reader(str(sld_path))
-#     confocal_notes = pd.read_csv(cf_raw_path / 'notes.csv')
-#     capture_name = confocal_notes.loc[confocal_notes['note']==img_name,'capture names'].values[0]
-#     img_reader = None
-#     for i in range(len(r._images)):
-#         if r._images[i].image_directory.stem==capture_name:
-#             img_reader = r._images[i]
-#             break
-#     if img_reader is None:
-#         raise ValueError(f"Could not find capture name {capture_name} in confocal sldy file")
-
-#     reader_attrs = list(img_reader.__dict__.keys())
-#     size_attrs = [attr for attr in reader_attrs if 'size' in attr]
-#     size_attrs = {attr: getattr(img_reader, attr) for attr in size_attrs}
-#     return size_attrs
 
 def generate_confocal_sdata(zarr_path, raw_confocal_path=None):
     cf_name = zarr_path.stem
