@@ -3,6 +3,33 @@ from spatialdata.transformations import Scale, Translation, Sequence, Identity, 
 import xarray as xr
 import numpy as np
 import pandas as pd
+import json
+from pathlib import Path
+
+def get_dataset_paths(dataset_id, 
+                            data_root=Path('/root/capsule/data'),
+                            scratch_root=Path('/root/capsule/scratch'),
+                            results_root=Path('/root/capsule/results'),
+                            code_root=Path('/root/capsule/code')):
+    datasets_naming_dict_path = code_root / 'datasets_names_dict.json'
+    with open(datasets_naming_dict_path) as f:
+        datasets_naming_dict = json.load(f)
+    dataset_id = str(dataset_id)  # Ensure string format
+    dataset_config = datasets_naming_dict[dataset_id]
+    
+    paths = {
+        "data_root": data_root,
+        "scratch_root": scratch_root,
+        "results_root": results_root,
+        "xenium_dataset_name": dataset_config.get("xenium_name", None),
+        "sdata_path": data_root / f'{dataset_config.get("xenium_name", None)}_processed',
+        "confocal_path": data_root / dataset_config.get("confocal_name", None),
+        "raw_confocal_path": data_root / dataset_config.get("raw_confocal_name", None),
+        "zstack_path": data_root / dataset_config.get("zstack_name", None),
+        "zstack_masks": data_root / dataset_config.get("zstack_masks_name", None),
+    }
+    
+    return paths
 
 def add_micron_coord_sys(sdata, pixel_size=None, z_step=None):
     # Define the pixel scaling factor
@@ -16,15 +43,15 @@ def add_micron_coord_sys(sdata, pixel_size=None, z_step=None):
     # 2D Images (channel, y, x)
     # c = 1.0 (channels are discrete)
     scale_yx = Scale([pixel_size, pixel_size], axes=("y", "x"))
-    scale_cyx = Scale([1.0, pixel_size, pixel_size], axes=("c", "y", "x"))
+    scale_cyx = Scale([pixel_size, pixel_size], axes=("y", "x"))
 
     # For 3D Z-Stacks (c, z, y, x)
     # c = 1.0 (channels are discrete)
     # z = 3.0 (microns per plane)
     # y, x = 0.2125 (microns per pixel)
     scale_czyx = Scale(
-        [1.0, z_step, pixel_size, pixel_size], 
-        axes=("c", "z", "y", "x")
+        [z_step, pixel_size, pixel_size], 
+        axes=("z", "y", "x")
     )
 
     # Identity transform for elements already in microns
@@ -97,6 +124,110 @@ def add_mapped_cells_cols(sdata, mapped_h5ad_path):
             right_index=True,
             how='outer'
         )
+    return sdata
+
+def add_type_id_columns(sdata, col_name, table_name='table'):
+    if col_name in sdata[table_name].obs.columns:
+        col_id = col_name.replace('name', 'id')
+        sdata[table_name].obs[col_id] = sdata[table_name].obs[col_name].str.split(' ').str[0].astype('int')
+        print(f"Added {col_id} column")
+    else:
+        print(f"{col_name} column not found in {table_name}.obs")
+    return sdata
+
+def add_grouped_types_columns(sdata,
+                           new_col,
+                           type_mappings=None,
+                           table_name='table',
+                           null_value='other'):
+    default_mappings = {
+        'broad_class': {
+            'class_name': [
+                {'op': 'contains', 'value': 'GABA', 'assign': 'GABAergic'},
+                {'op': 'contains', 'value': 'Glut', 'assign': 'Glutamatergic'},
+            ],
+            'class_id': [
+                {'op': 'gte', 'value': 29, 'assign': 'Non-neuronal'}
+            ]
+        }
+    }
+
+    if type_mappings is None:
+        type_mappings = default_mappings.get(new_col, {})
+
+    norm_mappings = {}
+    for crit_col, rules in type_mappings.items():
+        norm = []
+        if isinstance(rules, dict):
+            for assign, crit in rules.items():
+                if isinstance(crit, (list, tuple)) and len(crit) >= 2:
+                    op, val = crit[0], crit[1]
+                else:
+                    op, val = 'contains', crit
+                norm.append({'op': op, 'value': val, 'assign': assign})
+        elif isinstance(rules, (list, tuple)):
+            for r in rules:
+                if isinstance(r, dict) and {'op', 'value', 'assign'}.issubset(r.keys()):
+                    norm.append(r)
+                elif isinstance(r, (list, tuple)) and len(r) >= 3:
+                    op, val, assign = r[0], r[1], r[2]
+                    norm.append({'op': op, 'value': val, 'assign': assign})
+                else:
+                    # skip unknown rule format
+                    continue
+        norm_mappings[crit_col] = norm
+
+    # Initialize column
+    print(f"Adding '{new_col}' to {table_name}.obs")
+    sdata[table_name].obs[new_col] = null_value
+
+    for crit_col, rules in norm_mappings.items():
+        if crit_col not in sdata[table_name].obs.columns:
+            # skip missing criteria columns
+            continue
+        series = sdata[table_name].obs[crit_col]
+
+        for rule in rules:
+            op = rule['op']
+            val = rule['value']
+            assign = rule['assign']
+
+            mask = pd.Series(False, index=series.index)
+
+            try:
+                if op == 'contains':
+                    mask = series.astype(str).str.contains(str(val), na=False)
+                elif op == 'in':
+                    if isinstance(val, (list, tuple, set)):
+                        mask = series.isin(val)
+                    else:
+                        mask = series == val
+                elif op == 'eq':
+                    mask = series == val
+                elif op == 'neq':
+                    mask = series != val
+                elif op in ('gte', 'lte', 'gt', 'lt'):
+                    num = pd.to_numeric(series, errors='coerce')
+                    cmp_val = float(val)
+                    if op == 'gte':
+                        mask = num >= cmp_val
+                    elif op == 'lte':
+                        mask = num <= cmp_val
+                    elif op == 'gt':
+                        mask = num > cmp_val
+                    elif op == 'lt':
+                        mask = num < cmp_val
+                elif op == 'regex':
+                    mask = series.astype(str).str.match(str(val))
+                else:
+                    # unknown op -> skip
+                    continue
+            except Exception:
+                # on any evaluation error, skip this rule
+                continue
+
+            sdata[table_name].obs.loc[mask, new_col] = assign
+
     return sdata
 
 def get_transcripts_bboxes(transcripts, id_col='cell_labels'):
