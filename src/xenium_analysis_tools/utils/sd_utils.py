@@ -6,6 +6,24 @@ import pandas as pd
 import json
 from pathlib import Path
 
+def get_channel_name(image, chan, print_chan_names_only=False):
+    channel_aliases = {'DAPI': ['dapi','nuclear'], 
+                    'ATP1A1/CD45/E-Cadherin': ['boundary'],
+                    '18S': ['rna', 'RNA'],
+                    'AlphaSMA/Vimentin': ['protein']
+    }
+    if print_chan_names_only:
+        chan_names = sd.models.get_channel_names(image)
+        print('Available channel names:')
+        for name in chan_names:
+            print(f' - {name}')
+        return None
+    for chan_label, aliases in channel_aliases.items():
+        for alias in aliases:
+            if alias.lower() in chan.lower():
+                return chan_label
+    return chan
+
 def get_dataset_paths(dataset_id, 
                             data_root=Path('/root/capsule/data'),
                             scratch_root=Path('/root/capsule/scratch'),
@@ -99,46 +117,44 @@ def add_micron_coord_sys(sdata, pixel_size=None, z_step=None):
         )
     return sdata
 
-def add_mapped_cells_cols(sdata, mapped_h5ad_path):
+def add_mapped_cells_cols(adata, mapped_adata):
     import scanpy as sc
-    mapped_h5ad = sc.read_h5ad(mapped_h5ad_path)
-    mapping_obs_cols = np.setdiff1d(mapped_h5ad.obs.columns, sdata['table'].obs.columns)
+    mapping_obs_cols = np.setdiff1d(mapped_adata.obs.columns, adata.obs.columns)
     if len(mapping_obs_cols) == 0:
         print("No new columns to add from mapped data")
     else:
         print(f"Adding {len(mapping_obs_cols)} columns from mapped data: {mapping_obs_cols}")
-        sdata['table'].obs = sdata['table'].obs.merge(
-            mapped_h5ad.obs[mapping_obs_cols],
+        adata.obs = adata.obs.merge(
+            mapped_adata.obs[mapping_obs_cols],
             left_index=True,
             right_index=True,
             how='outer'
         )
-    mapping_vars_cols = np.setdiff1d(mapped_h5ad.var.columns, sdata['table'].var.columns)
+    mapping_vars_cols = np.setdiff1d(mapped_adata.var.columns, adata.var.columns)
     if len(mapping_vars_cols) == 0:
         print("No new columns to add from mapped data")
     else:
         print(f"Adding {len(mapping_vars_cols)} columns from mapped data: {mapping_vars_cols}")
-        sdata['table'].var = sdata['table'].var.merge(
-            mapped_h5ad.var[mapping_vars_cols],
+        adata.var = adata.var.merge(
+            mapped_adata.var[mapping_vars_cols],
             left_index=True,
             right_index=True,
             how='outer'
         )
-    return sdata
+    return adata
 
-def add_type_id_columns(sdata, col_name, table_name='table'):
-    if col_name in sdata[table_name].obs.columns:
+def add_type_id_columns(adata, col_name):
+    if col_name in adata.obs.columns:
         col_id = col_name.replace('name', 'id')
-        sdata[table_name].obs[col_id] = sdata[table_name].obs[col_name].str.split(' ').str[0].astype('int')
+        adata.obs[col_id] = adata.obs[col_name].str.split(' ').str[0].astype('int')
         print(f"Added {col_id} column")
     else:
-        print(f"{col_name} column not found in {table_name}.obs")
-    return sdata
+        print(f"{col_name} column not found in adata.obs")
+    return adata
 
-def add_grouped_types_columns(sdata,
+def add_grouped_types_columns(adata,
                            new_col,
                            type_mappings=None,
-                           table_name='table',
                            null_value='other'):
     default_mappings = {
         'broad_class': {
@@ -178,14 +194,14 @@ def add_grouped_types_columns(sdata,
         norm_mappings[crit_col] = norm
 
     # Initialize column
-    print(f"Adding '{new_col}' to {table_name}.obs")
-    sdata[table_name].obs[new_col] = null_value
+    print(f"Adding '{new_col}' to adata.obs")
+    adata.obs[new_col] = null_value
 
     for crit_col, rules in norm_mappings.items():
-        if crit_col not in sdata[table_name].obs.columns:
+        if crit_col not in adata.obs.columns:
             # skip missing criteria columns
             continue
-        series = sdata[table_name].obs[crit_col]
+        series = adata.obs[crit_col]
 
         for rule in rules:
             op = rule['op']
@@ -226,9 +242,9 @@ def add_grouped_types_columns(sdata,
                 # on any evaluation error, skip this rule
                 continue
 
-            sdata[table_name].obs.loc[mask, new_col] = assign
+            adata.obs.loc[mask, new_col] = assign
 
-    return sdata
+    return adata
 
 def get_transcripts_bboxes(transcripts, id_col='cell_labels'):
     transcripts = transcripts.compute() if hasattr(transcripts, 'compute') else transcripts

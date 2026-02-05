@@ -18,20 +18,3 @@ def get_vals_perc(img, chan, vmin_val=None, vmax_val=None, vmin_perc=None, vmax_
 
     return vmin, vmax
 
-def get_channel_name(chan, print_chan_names_only=False):
-    channel_aliases = {'DAPI': ['dapi','nuclear'], 
-                    'ATP1A1/CD45/E-Cadherin': ['boundary'],
-                    '18S': ['rna, RNA'],
-                    'AlphaSMA/Vimentin': ['protein']
-    }
-    if print_chan_names_only:
-        chan_names = sd.models.get_channel_names(section_sdata[image_name])
-        print('Available channel names:')
-        for name in chan_names:
-            print(f' - {name}')
-        return None
-    for chan_label, aliases in channel_aliases.items():
-        for alias in aliases:
-            if alias.lower() in chan.lower():
-                return chan_label
-    return chan
