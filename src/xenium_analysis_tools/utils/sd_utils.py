@@ -40,11 +40,11 @@ def get_dataset_paths(dataset_id,
         "scratch_root": scratch_root,
         "results_root": results_root,
         "xenium_dataset_name": dataset_config.get("xenium_name", None),
-        "sdata_path": data_root / f'{dataset_config.get("xenium_name", None)}_processed',
-        "confocal_path": data_root / dataset_config.get("confocal_name", None),
-        "raw_confocal_path": data_root / dataset_config.get("raw_confocal_name", None),
-        "zstack_path": data_root / dataset_config.get("zstack_name", None),
-        "zstack_masks": data_root / dataset_config.get("zstack_masks_name", None),
+        "sdata_path": data_root / f'{dataset_config["xenium_name"]}_processed' if dataset_config.get("xenium_name") else None,
+        "confocal_path": data_root / dataset_config["confocal_name"] if dataset_config.get("confocal_name") else None,
+        "raw_confocal_path": data_root / dataset_config["raw_confocal_name"] if dataset_config.get("raw_confocal_name") else None,
+        "zstack_path": data_root / dataset_config["zstack_name"] if dataset_config.get("zstack_name") else None,
+        "zstack_masks": data_root / dataset_config["zstack_masks_name"] if dataset_config.get("zstack_masks_name") else None,
     }
     
     return paths

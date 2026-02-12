@@ -39,16 +39,15 @@ def get_confocal_image_sizes(img_name, cf_raw_path, overlap=0.1):
         'physical_pixel_size_z': 1.0 # Placeholder if not in YAML
     }
 
-def generate_confocal_sdata(zarr_path, raw_confocal_path=None):
+def generate_confocal_sdata(zarr_path, raw_confocal_path=None, select_scales=None):
     cf_name = zarr_path.stem
-    cf_dt = create_datatree_from_zarr(zarr_path, chan_name=cf_name)
+    cf_dt = create_datatree_from_zarr(zarr_path, chan_name=cf_name, select_scales=select_scales)
 
     cf_sdata = sd.SpatialData(
             images={cf_name: cf_dt}
     )
 
     if raw_confocal_path:
-        # cf_sizes = get_confocal_image_sizes(cf_name, raw_confocal_path)
         cf_sizes = get_confocal_image_sizes(cf_name, raw_confocal_path)
         cf_sdata[cf_name].attrs.update(cf_sizes)
         if not cf_sizes['physical_pixel_size_x']==cf_sizes['physical_pixel_size_y']:
@@ -58,11 +57,14 @@ def generate_confocal_sdata(zarr_path, raw_confocal_path=None):
 
     return cf_sdata
 
-def create_datatree_from_zarr(zarr_path, chan_name='chan'):
+def create_datatree_from_zarr(zarr_path, chan_name='chan', select_scales=None):
     root = zarr.open_group(zarr_path, mode='r')
     data_tree_obj = xr.DataTree()
 
     for scale_level in sorted(list(root.keys())):
+        if scale_level != '0': #Have to have scale0 to determine sizes, but can drop later
+            if select_scales is not None and scale_level not in select_scales:
+                continue
         # Load the image data at this scale level
         level_array = da.from_zarr(str(zarr_path / scale_level))
         level_array = np.expand_dims(level_array, axis=0)  # Add c dimension
@@ -87,9 +89,16 @@ def create_datatree_from_zarr(zarr_path, chan_name='chan'):
             set_transformation(data_tree_obj[scale_key].image, sequence, to_coordinate_system="global")
         else:
             set_transformation(data_tree_obj[scale_key].image, Identity(), to_coordinate_system="global")
+
+    if select_scales is not None and '0' not in select_scales:
+        del data_tree_obj['scale0']
+    if select_scales is not None: # rename scales
+        for n, scale_level in enumerate(list(data_tree_obj.keys())):
+            data_tree_obj[f'scale{n}'] = data_tree_obj[scale_level]
+            data_tree_obj[f'scale{n}'].image.attrs[f'original_scale_level'] = scale_level
+            del data_tree_obj[scale_level]
+
     return data_tree_obj
-
-
 
 # Coped from capsule 4 to keep track of overlap blending code
 def generate_fused_confocal_images(data_asset, overlap=0.1, img_layers=6):
@@ -177,3 +186,24 @@ def generate_fused_confocal_images(data_asset, overlap=0.1, img_layers=6):
         scaler = Scaler(method='nearest', max_layer=img_layers)  # Create 4 levels in the pyramid
         # Write the image data with pyramid
         write_image(image, root, scaler=scaler, axes = 'zyx')
+
+def get_confocal_sdata(confocal_zarr_path, raw_confocal_path, select_scales=None):
+    sdatas = []
+    if 'deep' in [zarrs.stem for zarrs in list(confocal_zarr_path.iterdir()) if zarrs.suffix == '.zarr']:
+        print("Generating sdata for deep confocal...")
+        deep_sdata = generate_confocal_sdata(
+            zarr_path = confocal_zarr_path / 'deep.zarr',
+            raw_confocal_path = raw_confocal_path,
+            select_scales=select_scales
+        )
+        sdatas.append(deep_sdata)
+    if 'surface' in [zarrs.stem for zarrs in list(confocal_zarr_path.iterdir()) if zarrs.suffix == '.zarr']:
+        print("Generating sdata for surface confocal...")
+        surface_sdata = generate_confocal_sdata(
+            zarr_path = confocal_zarr_path / 'surface.zarr',
+            raw_confocal_path = raw_confocal_path,
+            select_scales=select_scales
+        )
+        sdatas.append(surface_sdata)
+    confocal_sdata = sd.concatenate(sdatas, merge_coord_systems=True)
+    return confocal_sdata
