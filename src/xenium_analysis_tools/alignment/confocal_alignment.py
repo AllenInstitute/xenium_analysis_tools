@@ -1,17 +1,14 @@
-
+from xenium_analysis_tools.utils.sd_utils import add_micron_coord_sys
 from spatialdata.transformations import Scale, Identity, Sequence, set_transformation, get_transformation
 from spatialdata.models import Image3DModel
 import spatialdata as sd
 import xarray as xr
 import dask.array as da
 import zarr
-from xenium_analysis_tools.utils.sd_utils import add_micron_coord_sys
 import pandas as pd
 import numpy as np
-# from bioio_sldy import Reader
-import pandas as pd
 import yaml
-import os
+from pathlib import Path
 
 def get_confocal_image_sizes(img_name, cf_raw_path, overlap=0.1):
     confocal_notes = pd.read_csv(cf_raw_path / 'notes.csv')
@@ -33,15 +30,17 @@ def get_confocal_image_sizes(img_name, cf_raw_path, overlap=0.1):
         'sizeZ': shape[0],
         'sizeY': shape[1],
         'sizeX': shape[2],
-        'sizeC': 1, # Confocal captures are usually single channel per dir
+        'sizeC': 1,
         'physical_pixel_size_x': phys_x,
-        'physical_pixel_size_y': phys_x, # Typically square
-        'physical_pixel_size_z': 1.0 # Placeholder if not in YAML
+        'physical_pixel_size_y': phys_x,
+        'physical_pixel_size_z': 1.0
     }
 
-def generate_confocal_sdata(zarr_path, raw_confocal_path=None, select_scales=None):
+def generate_confocal_sdata(zarr_path, raw_confocal_path=None, select_scales=['0','1','2','3'], 
+                           chunk_size=(1, 64, 512, 512)):
     cf_name = zarr_path.stem
-    cf_dt = create_datatree_from_zarr(zarr_path, chan_name=cf_name, select_scales=select_scales)
+    cf_dt = create_datatree_from_zarr(zarr_path, chan_name=cf_name, 
+                                     select_scales=select_scales, chunk_size=chunk_size)
 
     cf_sdata = sd.SpatialData(
             images={cf_name: cf_dt}
@@ -50,160 +49,122 @@ def generate_confocal_sdata(zarr_path, raw_confocal_path=None, select_scales=Non
     if raw_confocal_path:
         cf_sizes = get_confocal_image_sizes(cf_name, raw_confocal_path)
         cf_sdata[cf_name].attrs.update(cf_sizes)
-        if not cf_sizes['physical_pixel_size_x']==cf_sizes['physical_pixel_size_y']:
-            raise ValueError(f"Confocal pixel sizes in X and Y do not match for {cf_name}!")
-        else:
-            cf_sdata = add_micron_coord_sys(cf_sdata, pixel_size=cf_sizes['physical_pixel_size_x'])
+        cf_sdata = add_micron_coord_sys(cf_sdata, pixel_size=[cf_sizes['physical_pixel_size_y'], cf_sizes['physical_pixel_size_x']], z_step=cf_sizes['physical_pixel_size_z'])
 
     return cf_sdata
 
-def create_datatree_from_zarr(zarr_path, chan_name='chan', select_scales=None):
+def create_datatree_from_zarr(zarr_path, chan_name='chan', select_scales=['0','1','2','3'], 
+                             chunk_size=(1, 64, 512, 512)):
     root = zarr.open_group(zarr_path, mode='r')
     data_tree_obj = xr.DataTree()
-
-    for scale_level in sorted(list(root.keys())):
-        if scale_level != '0': #Have to have scale0 to determine sizes, but can drop later
+    
+    # Pre-calculate which scales to process
+    available_scales = sorted(list(root.keys()))
+    if select_scales is not None:
+        # Always include scale0 for size calculations, filter later
+        scales_to_process = ['0'] + [s for s in select_scales if s != '0']
+    else:
+        scales_to_process = available_scales
+    
+    scale0_shape = None
+    
+    for scale_level in scales_to_process:
+        if scale_level not in available_scales:
+            continue
+            
+        if scale_level != '0':
             if select_scales is not None and scale_level not in select_scales:
                 continue
-        # Load the image data at this scale level
-        level_array = da.from_zarr(str(zarr_path / scale_level))
-        level_array = np.expand_dims(level_array, axis=0)  # Add c dimension
-        # Convert to xarray DataArray
+                
+        print(f"Adding scale level: {scale_level}")
+        
+        # Optimize zarr loading with explicit chunking
+        level_array = da.from_zarr(str(zarr_path / scale_level), chunks=chunk_size[1:])  # Skip c dim
+        level_array = da.expand_dims(level_array, axis=0)  # Add c dimension
+        
+        # Store scale0 shape for later calculations
+        if scale_level == '0':
+            scale0_shape = level_array.shape
+        
+        # Convert to xarray DataArray with optimized chunking
         data_array = xr.DataArray(
-                level_array,
-                dims=['c', 'z', 'y', 'x']
-            )
-        parsed_array = Image3DModel.parse(
-                            data_array,
-                            dims=['c', 'z', 'y', 'x'],
-                            c_coords=chan_name,
-                            chunks='auto', 
+            level_array,
+            dims=['c', 'z', 'y', 'x']
         )
+        
+        parsed_array = Image3DModel.parse(
+            data_array,
+            dims=['c', 'z', 'y', 'x'],
+            c_coords=[chan_name],  # Use list for consistency
+            chunks=chunk_size,  # Explicit chunking
+        )
+        
         scale_key = f'scale{scale_level}'
         data_tree_obj[scale_key] = xr.Dataset({'image': parsed_array})
-        # Set up scale transformation for non-zero scales
-        if scale_key != 'scale0':
-            scale_factors = np.array(data_tree_obj[f'scale0'].image.shape) / np.array(data_tree_obj[scale_key].image.shape)
-            scale_transform = Scale(scale_factors, axes=data_tree_obj[scale_key].image.dims)
+        
+        # Set up transformations more efficiently
+        if scale_level != '0' and scale0_shape is not None:
+            current_shape = level_array.shape
+            scale_factors = np.array(scale0_shape) / np.array(current_shape)
+            scale_transform = Scale(scale_factors, axes=parsed_array.dims)
             sequence = Sequence([scale_transform, Identity()])
-            set_transformation(data_tree_obj[scale_key].image, sequence, to_coordinate_system="global")
+            set_transformation(parsed_array, sequence, to_coordinate_system="global")
         else:
-            set_transformation(data_tree_obj[scale_key].image, Identity(), to_coordinate_system="global")
+            set_transformation(parsed_array, Identity(), to_coordinate_system="global")
 
+    # Handle scale removal and renaming more efficiently
     if select_scales is not None and '0' not in select_scales:
+        print("Removing scale0 from data tree as it's not in select_scales")
         del data_tree_obj['scale0']
-    if select_scales is not None: # rename scales
-        for n, scale_level in enumerate(list(data_tree_obj.keys())):
-            data_tree_obj[f'scale{n}'] = data_tree_obj[scale_level]
-            data_tree_obj[f'scale{n}'].image.attrs[f'original_scale_level'] = scale_level
-            del data_tree_obj[scale_level]
-
+    
+    # Optimize renaming logic
+    if select_scales is not None:
+        orig_keys = list(data_tree_obj.keys())
+        desired_keys = [f"scale{idx}" for idx in range(len(orig_keys))]
+        
+        if orig_keys != desired_keys:
+            print("Renaming scales to ensure sequential order")
+            # Use dict comprehension for faster renaming
+            renamed_datasets = {}
+            for n, old_key in enumerate(orig_keys):
+                new_key = f"scale{n}"
+                print(f"  Renaming {old_key} -> {new_key}")
+                dataset = data_tree_obj[old_key].copy(deep=False)  # Shallow copy
+                dataset.image.attrs['original_scale_level'] = old_key
+                renamed_datasets[new_key] = dataset
+            
+            # Rebuild tree from dict
+            data_tree_obj = xr.DataTree.from_dict(renamed_datasets)
+            
     return data_tree_obj
 
-# Coped from capsule 4 to keep track of overlap blending code
-def generate_fused_confocal_images(data_asset, overlap=0.1, img_layers=6):
-    notes = pd.read_csv(os.path.join(data_asset, 'notes.csv'))
-    notes=notes[notes['note']!='qc'].reset_index(drop=True)
-    today_str = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    processed_dir = os.path.join(data_asset.replace('/data/','/scratch/')+'_processed_'+today_str)
-    for idx, row in notes.iterrows():
-        image_dir = os.path.join(data_asset,[d for d in os.listdir(data_asset) if d.endswith('.dir')][0] ,row['capture names']+'.imgdir')
-        zarr_filename = os.path.join(processed_dir, row['note'] + '.zarr') 
-        tif_filename = zarr_filename.replace('.zarr','.tif')
-        if os.path.exists(zarr_filename):
-            print('skipping', data_asset, row['note'])
-            continue
-        
-        try:
-            yaml_file = os.path.join(image_dir,'StagePositionData.yaml')
-            StagePositionData = open_yaml(yaml_file)
-            positions = (np.array(StagePositionData['StructArrayValues'])/100).astype(int)
-        except:
-            print('no position data for', data_asset, row['note'])
-            continue
-        for p in range(3):
-            positions[p::3] = rankdata(-positions[p::3], method='dense')-1
-            
-        locs = positions.reshape(-1,3)[:,:-1][:,::-1].astype(int)
-        n_rows = np.max(locs[:,0])+1
-        n_cols = np.max(locs[:,1])+1
-        
-        if n_rows*n_cols == 1:
-            print('no fusion needed for', data_asset, row['note'])
-            file = os.path.join(image_dir, [f for f in os.listdir(image_dir) if f.endswith('.npy') and f.startswith('ImageData')][0])
-            image = np.load(file)    
-
-        else:   
-            files = [f for f in os.listdir(image_dir) if f.endswith('.npy') and f.startswith('ImageData')]
-            files = np.sort(files)
-            image_ = np.load(os.path.join(image_dir, files[0]))
-            n_tiles = len(locs)
-            x_size = image_.shape[1]
-            y_size = image_.shape[2]
-            z_size = image_.shape[0]
-            image = np.zeros((z_size,int(x_size*(n_rows-overlap*(n_rows-1))), int(y_size*(n_cols-overlap*(n_cols-1)))),dtype=np.uint16)
-            print('fusing', data_asset, row['note'])
-            for ind_tile in range(n_tiles):
-                tile_ = np.load(os.path.join(image_dir, files[ind_tile]))
-                for z in tqdm(range(z_size), desc=f'Fusing tile {ind_tile+1}/{n_tiles}'):
-
-                    tile = tile_[z]
-                    if locs[ind_tile][0] == 0:
-                        x_start = 0
-                        x_end = x_size  
-                    else:
-                        x_start = int(x_size*(locs[ind_tile][0]*(1-overlap)))
-                        x_end = x_start+x_size
-                        
-                        
-                    if locs[ind_tile][0] < np.max(locs,axis=0)[0]:
-                        tile[-int(overlap*x_size):, :] = tile[-int(overlap*x_size):, :]*(1-sigmoid_vector(int(overlap*x_size), y_size))
-                    
-                    if locs[ind_tile][0] > 0:
-                        tile[:int(overlap*x_size), :] = tile[:int(overlap*x_size), :]*sigmoid_vector(int(overlap*x_size), y_size)
-                    
-                    if locs[ind_tile][1] == 0:
-                        y_start = 0
-                        y_end = y_size
-                    else:
-                        y_start = int(y_size*(locs[ind_tile][1]*(1-overlap)))
-                        y_end = y_start+y_size
-                        
-                        
-                    if locs[ind_tile][1] < np.max(locs,axis=0)[1]:
-                        tile[:, -int(overlap*y_size):] = tile[:, -int(overlap*y_size):]*(1-sigmoid_vector(int(overlap*y_size),x_size).T)
-                        
-                    if locs[ind_tile][1] > 0:
-                        tile[:, :int(overlap*y_size)] = tile[:, :int(overlap*y_size)]*sigmoid_vector(int(overlap*y_size),x_size).T
-
-                    image[z,x_start:x_end, y_start:y_end] += tile
-        os.makedirs(processed_dir, exist_ok=True)
-        tiff.imwrite(tif_filename, image)
-        store = zarr.storage.LocalStore(zarr_filename)
-        root = zarr.group(store=store, zarr_format=2)
-
-        # Define a scaler for creating the image pyramid
-        scaler = Scaler(method='nearest', max_layer=img_layers)  # Create 4 levels in the pyramid
-        # Write the image data with pyramid
-        write_image(image, root, scaler=scaler, axes = 'zyx')
-
-def get_confocal_sdata(confocal_zarr_path, raw_confocal_path, select_scales=None):
+def get_confocal_sdata(confocal_zarr_path, raw_confocal_path, select_scales=['0','1','2','3'], 
+                       chunk_size=(1, 64, 512, 512)):
     sdatas = []
-    if 'deep' in [zarrs.stem for zarrs in list(confocal_zarr_path.iterdir()) if zarrs.suffix == '.zarr']:
+    
+    # Use pathlib for more efficient path operations
+    confocal_path = Path(confocal_zarr_path)
+    zarr_files = [f.stem for f in confocal_path.glob('*.zarr')]
+    
+    if 'deep' in zarr_files:
         print("Generating sdata for deep confocal...")
         deep_sdata = generate_confocal_sdata(
-            zarr_path = confocal_zarr_path / 'deep.zarr',
-            raw_confocal_path = raw_confocal_path,
-            select_scales=select_scales
+            zarr_path=confocal_path / 'deep.zarr',
+            raw_confocal_path=raw_confocal_path,
+            select_scales=select_scales,
+            chunk_size=chunk_size
         )
         sdatas.append(deep_sdata)
-    if 'surface' in [zarrs.stem for zarrs in list(confocal_zarr_path.iterdir()) if zarrs.suffix == '.zarr']:
+        
+    if 'surface' in zarr_files:
         print("Generating sdata for surface confocal...")
         surface_sdata = generate_confocal_sdata(
-            zarr_path = confocal_zarr_path / 'surface.zarr',
-            raw_confocal_path = raw_confocal_path,
-            select_scales=select_scales
+            zarr_path=confocal_path / 'surface.zarr',
+            raw_confocal_path=raw_confocal_path,
+            select_scales=select_scales,
+            chunk_size=chunk_size
         )
         sdatas.append(surface_sdata)
+        
     confocal_sdata = sd.concatenate(sdatas, merge_coord_systems=True)
     return confocal_sdata

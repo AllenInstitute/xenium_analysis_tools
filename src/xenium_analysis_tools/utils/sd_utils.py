@@ -58,23 +58,19 @@ def add_micron_coord_sys(sdata, pixel_size=None, z_step=None):
     else:
         z_step = 1.0
 
+    if isinstance(pixel_size, (int, float)):
+        pixel_size = [pixel_size, pixel_size]
+        
     # 2D Images (channel, y, x)
-    # c = 1.0 (channels are discrete)
-    scale_yx = Scale([pixel_size, pixel_size], axes=("y", "x"))
-    scale_cyx = Scale([pixel_size, pixel_size], axes=("y", "x"))
+    scale_yx = Scale(pixel_size, axes=("y", "x"))
 
     # For 3D Z-Stacks (c, z, y, x)
-    # c = 1.0 (channels are discrete)
-    # z = 3.0 (microns per plane)
-    # y, x = 0.2125 (microns per pixel)
     scale_czyx = Scale(
-        [z_step, pixel_size, pixel_size], 
+        [z_step] + pixel_size, 
         axes=("z", "y", "x")
     )
 
-    # Identity transform for elements already in microns
     identity = Identity()
-
     # --- Images ---
     for image_name in sdata.images:
         dims = sdata[image_name].dims if not isinstance(sdata[image_name], xr.core.datatree.DataTree) else sdata[image_name]['scale0'].dims
@@ -87,12 +83,11 @@ def add_micron_coord_sys(sdata, pixel_size=None, z_step=None):
         else:
             set_transformation(
                 sdata.images[image_name], 
-                scale_cyx, 
+                scale_yx, 
                 to_coordinate_system="microns"
             )
 
-    # --- Labels ---
-    # Both labels are (y, x)
+    # Labels
     for label_name in sdata.labels:
         set_transformation(
             sdata.labels[label_name], 
@@ -100,15 +95,14 @@ def add_micron_coord_sys(sdata, pixel_size=None, z_step=None):
             to_coordinate_system="microns"
         )
 
-    # --- Shapes & Points ---
-    # Already in microns
+    # Shapes
     for shape_name in sdata.shapes:
         set_transformation(
             sdata.shapes[shape_name], 
             identity, 
             to_coordinate_system="microns"
         )
-
+    # Points
     for point_name in sdata.points:
         set_transformation(
             sdata.points[point_name], 
@@ -119,6 +113,8 @@ def add_micron_coord_sys(sdata, pixel_size=None, z_step=None):
 
 def add_mapped_cells_cols(adata, mapped_adata):
     import scanpy as sc
+    if isinstance(mapped_adata, str) or isinstance(mapped_adata, Path):
+        mapped_adata = sc.read(mapped_adata)
     mapping_obs_cols = np.setdiff1d(mapped_adata.obs.columns, adata.obs.columns)
     if len(mapping_obs_cols) == 0:
         print("No new columns to add from mapped data")
