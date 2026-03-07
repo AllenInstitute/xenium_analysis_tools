@@ -49,7 +49,7 @@ def parse_stack_metadata(folder, lookup_chans=['gcamp', 'dextran']):
 
     return {"size": size, "detected_channels": detected_channels, "tifs": tifs, "jsons": jsons, "name": folder.name}
 
-def get_zstack_images(stack_folder, chan_mapping=None, chunk_size=(1, 256, 256, 256)):
+def get_zstack_images(stack_folder, chan_mapping=None, chunk_size=(1, 256, 256, 256), scale_factors=[2]):
     if chan_mapping is None:
         chan_mapping = {
              'channel_0_ref_0': 'gcamp',
@@ -96,7 +96,7 @@ def get_zstack_images(stack_folder, chan_mapping=None, chunk_size=(1, 256, 256, 
     zstack_chans = Image3DModel.parse(img_chans_da,
                             c_coords=channel_names,
                             chunks=chunk_size,
-                            scale_factors=[2])
+                            scale_factors=scale_factors)
     zstack_chans.attrs.update(img_chans_da.attrs)
     zstack_chans.attrs['fov_size'] = fov
     return zstack_chans
@@ -123,7 +123,7 @@ def get_zstack_labels(stack_folder, zstack_masks, chan_mapping=None, chunk_size=
         labels[labels_name] = chan_masks
     return labels
 
-def generate_zstack_sdata(zstacks_path, zstack_masks_path, image_chunk_size=(1, 256, 256, 256), label_chunk_size=(256, 256, 256)):
+def generate_zstack_sdata(zstacks_path, zstack_masks_path, image_chunk_size=(1, 256, 256, 256), label_chunk_size=(256, 256, 256), scale_factors=[2]):
     sdata_dict = {}
     if len(list(zstacks_path.iterdir())) > 1:
         add_size_suffix = True
@@ -131,8 +131,8 @@ def generate_zstack_sdata(zstacks_path, zstack_masks_path, image_chunk_size=(1, 
     else:
         add_size_suffix = False
     for stack_folder in zstacks_path.iterdir():
-        zstack_images = get_zstack_images(stack_folder, chunk_size=image_chunk_size)
-        zstack_labels = get_zstack_labels(stack_folder, zstack_masks=zstack_masks_path, chunk_size=label_chunk_size)
+        zstack_images = get_zstack_images(stack_folder, chunk_size=image_chunk_size, scale_factors=scale_factors)
+        zstack_labels = get_zstack_labels(stack_folder, zstack_masks=zstack_masks_path, chunk_size=label_chunk_size, scale_factors=scale_factors)
         sdata = sd.SpatialData(
             images={'zstack': zstack_images},
             labels={**zstack_labels}

@@ -111,26 +111,42 @@ def add_micron_coord_sys(sdata, pixel_size=None, z_step=None):
         )
     return sdata
 
-def add_mapped_cells_cols(adata, mapped_adata):
+def add_mapped_cells_cols(adata, mapped_adata, verbose=False):
     import scanpy as sc
     if isinstance(mapped_adata, str) or isinstance(mapped_adata, Path):
         mapped_adata = sc.read(mapped_adata)
+    # Add class_id column
+    mapped_adata.obs['class_id'] = mapped_adata.obs['class_name'].str.split(' ').str[0].astype(int)
+
+    # Add broad_class
+    conditions = [
+        mapped_adata.obs['class_name'].str.contains('GABA'),
+        mapped_adata.obs['class_name'].str.contains('Glut'),
+        mapped_adata.obs['class_id'] >= 29
+    ]
+    mapped_adata.obs['broad_class'] = np.select(conditions, ['GABA', 'Glut', 'NN'], default='Other')
+
     mapping_obs_cols = np.setdiff1d(mapped_adata.obs.columns, adata.obs.columns)
     if len(mapping_obs_cols) == 0:
-        print("No new columns to add from mapped data")
+        if verbose:
+            print("No new columns to add from mapped data")
     else:
-        print(f"Adding {len(mapping_obs_cols)} columns from mapped data: {mapping_obs_cols}")
+        if verbose:
+            print(f"Adding {len(mapping_obs_cols)} columns from mapped data: {mapping_obs_cols}")
         adata.obs = adata.obs.merge(
             mapped_adata.obs[mapping_obs_cols],
             left_index=True,
             right_index=True,
             how='outer'
         )
+    
     mapping_vars_cols = np.setdiff1d(mapped_adata.var.columns, adata.var.columns)
     if len(mapping_vars_cols) == 0:
-        print("No new columns to add from mapped data")
+        if verbose:
+            print("No new columns to add from mapped data")
     else:
-        print(f"Adding {len(mapping_vars_cols)} columns from mapped data: {mapping_vars_cols}")
+        if verbose:
+            print(f"Adding {len(mapping_vars_cols)} columns from mapped data: {mapping_vars_cols}")
         adata.var = adata.var.merge(
             mapped_adata.var[mapping_vars_cols],
             left_index=True,
