@@ -102,7 +102,7 @@ def get_zstack_images(stack_folder, chan_mapping=None, chunk_size=(1, 256, 256, 
     return zstack_chans
 
 
-def get_zstack_labels(stack_folder, zstack_masks, chan_mapping=None, chunk_size=(256, 256, 256)):
+def get_zstack_labels(stack_folder, zstack_masks, chan_mapping=None, chunk_size=(256, 256, 256), scale_factors=[2]):
     if chan_mapping is None:
         chan_mapping = {
              'channel_0_ref_0': 'gcamp',
@@ -117,7 +117,7 @@ def get_zstack_labels(stack_folder, zstack_masks, chan_mapping=None, chunk_size=
         chan_name = chan_mapping.get(chan, chan)
         labels_name = f"{chan_name}_labels"
         img_da = create_zstack_da(tif_path, chan_name, fov_um=fov, add_chan=False)
-        chan_masks = Labels3DModel.parse(img_da, chunks=chunk_size, scale_factors=[2])
+        chan_masks = Labels3DModel.parse(img_da, chunks=chunk_size, scale_factors=scale_factors)
         chan_masks.attrs.update(img_da.attrs)
         chan_masks.attrs['fov_size'] = fov
         labels[labels_name] = chan_masks
