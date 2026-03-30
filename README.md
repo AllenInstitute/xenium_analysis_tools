@@ -51,6 +51,6 @@ Shared utility functions used across the library.
 [xenium_alignment](https://codeocean.allenneuraldynamics.org/capsule/1182895/tree)
 * Use landmarks to find affine transforms and align data modalities
 
-[xenium_napari_spatialdata](https://codeocean.allenneuraldynamics.org/capsule/2670815/tree)
+[xenium_napari_spatialdata](https://codeocean.allenneuraldynamics.org/capsule/8174127/tree)
 * View aligned sections in Napari
 
