@@ -30,8 +30,6 @@ dependencies = [
 mapping = [
     "cell-type-mapper @ git+https://github.com/AllenInstitute/cell_type_mapper.git@c8ee12659c4b8a8e260b091ce1aa0a145088ede5"
 ]
-
-[project.optional-dependencies]
 napari = [
     "napari-spatialdata @ git+https://github.com/scverse/napari-spatialdata#egg=napari-spatialdata"
 ]
