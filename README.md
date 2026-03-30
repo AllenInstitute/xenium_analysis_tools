@@ -45,14 +45,12 @@ Shared utility functions used across the library.
 [map_xenium_types](https://codeocean.allenneuraldynamics.org/capsule/7531529/tree)
 * Runs map_dataset_sections
 
-[xenium_analysis_capsule](https://codeocean.allenneuraldynamics.org/capsule/7962049/tree) (currently updating...)
+[xenium_analysis_capsule](https://codeocean.allenneuraldynamics.org/capsule/7962049/tree)
 * Capsule with notebooks for examples of how to work with SpatialData objects, explanations of processing steps, plotting, etc.
 
-## To-Dos:
-[ ]: Finish updating xenium_analysis_capsule
+[xenium_alignment](https://codeocean.allenneuraldynamics.org/capsule/1182895/tree)
+* Use landmarks to find affine transforms and align data modalities
 
-[ ]: Consolidate & add Xenium data QC functions and make new capsule
+[xenium_napari_spatialdata](https://codeocean.allenneuraldynamics.org/capsule/2670815/tree)
+* View aligned sections in Napari
 
-[ ]: Consolidate & add mapping evaluation/QC functions
-
-[ ]: Add functions for combining alignments
