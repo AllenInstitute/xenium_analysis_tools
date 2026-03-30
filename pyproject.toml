@@ -33,7 +33,7 @@ mapping = [
 
 [project.optional-dependencies]
 napari = [
-    "cell-type-mapper @ git+https://github.com/scverse/napari-spatialdata#egg=napari-spatialdata"
+    "napari-spatialdata @ git+https://github.com/scverse/napari-spatialdata#egg=napari-spatialdata"
 ]
 
 [dependency-groups]
