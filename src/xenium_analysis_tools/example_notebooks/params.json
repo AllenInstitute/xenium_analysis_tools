@@ -1,0 +1,76 @@
+{
+    "zarr_settings": {
+        "default_format": 3
+    },
+    "paths": {
+        "data_root": "/root/capsule/data",
+        "scratch_root": "/root/capsule/scratch",
+        "results_root": "/root/capsule/results",
+        "abc_path": "/root/capsule/data/abc_atlas",
+        "mmc_path": "/root/capsule/data/abc_atlas/mapmycells"
+    },
+    "sdata_reader_params": {
+        "n_jobs": "max",
+        "cells_as_circles": true,
+        "gex_only": false
+    },
+    "processing_control": {
+        "save_initial_data_parent_folder": "results",
+        "save_processed_data_parent_folder": "results",
+        "save_mapped_data_parent_folder": "results",
+        "save_initial_dataset_suffix": "_slides",
+        "save_mapped_dataset_suffix": "_mapped",
+        "save_processed_dataset_suffix": "_processed",
+        "save_initial_dataset_prefix": "slide_",
+        "save_processed_dataset_prefix": "section_",
+        "check_data_folder_slides": false,
+        "check_data_folder_sections": false,
+        "check_data_folder_mapped": true
+    },
+    "validation_params": {
+        "test_loading_data": false,
+        "test_sizes": true,
+        "plot_bboxes": true
+    },
+    "mapping_config": {
+        "input_data_folder_name": "input_data",
+        "input_h5ad_name": "input_cellxgene.h5ad",
+        "mapped_data_folder_name": "mapped_data",
+        "mapped_data_h5ad_name": "mapped_cellxgene.h5ad",
+        "basic_results_name": "basic_results.csv",
+        "extended_results_name": "extended_results.json",
+        "overwrite_all_steps": false,
+        "overwrite_input_data": false,
+        "overwrite_running_mapping": false,
+        "overwrite_formatting": false,
+        "overwrite_merge": false,
+        "validate_input": true,
+        "filter_mapping_v1_types": {
+            "enabled": true,
+            "h_level": "subclass",
+            "min_cells": 6,
+            "saved_df_name": "v1_merfish_cells.csv"
+        },
+        "drop_nodes_dict": null,
+        "var_filters": {
+            "feature_types": {
+                "eq": "Gene Expression"
+            },
+            "tag_feature": {
+                "eq": false
+            }
+        },
+        "mapping_params": {
+            "normalization": "raw",
+            "drop_level": "supertype",
+            "mapping_type": "hrc",
+            "bootstrap_iteration": 100,
+            "bootstrap_factor": 0.5,
+            "n_runner_ups": 2,
+            "clobber": "1",
+            "chunk_size": 15000,
+            "num_workers": 8,
+            "rng_seed": 42
+        }
+    }
+}

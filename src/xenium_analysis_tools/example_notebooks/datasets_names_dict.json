@@ -1,0 +1,114 @@
+{
+    "726465": {
+        "xenium_name": "Xenium_726465_2024-09-18",
+        "genotype": "Slc32a1-IRES-Cre;Oi1",
+        "sectioning_depth": 450,
+        "sections_thickness": 20
+    },
+    "738168": {
+        "xenium_name": "Xenium_738168_2025-03-12",
+        "genotype": "Slc32a1-IRES-Cre;Oi1",
+        "sectioning_depth": 450,
+        "sections_thickness": 20,
+        "confocal_name": "confocal-thick-tissue_748168_2025-02-13_processed_2026-01-07_01-02-54",
+        "raw_confocal_name": "confocal-thick-tissue_748168_2025-02-13",
+        "zstack_name": "ophys-z-stacks_748168_registered",
+        "zstack_masks_name": "ophys-z-stacks_748168_segmented"
+    },
+    "748168": {
+        "xenium_name": "Xenium_738168_2025-03-12",
+        "genotype": "Slc32a1-IRES-Cre;Oi1",
+        "sectioning_depth": 450,
+        "sections_thickness": 20,
+        "confocal_name": "confocal-thick-tissue_748168_2025-02-13_processed_2026-01-07_01-02-54",
+        "zstack_name": "ophys-z-stacks_748168_registered",
+        "zstack_masks_name": "ophys-z-stacks_748168_segmented"
+    },
+     "760970": {
+        "xenium_name": "Xenium_760970_2025-04-25",
+        "genotype": "Slc32a1-IRES-Cre;Oi1",
+        "sectioning_depth": 450,
+        "sections_thickness": 20
+    },
+    "756772": {
+        "xenium_name": "Xenium_756772_2025-04-23",
+        "genotype": "Slc32a1-IRES-Cre;Oi1",
+        "sectioning_depth": 450,
+        "sections_thickness": 20,
+        "confocal_name": "confocal-thick-tissue_756772_2025-04-09_processed_2026-01-07_00-36-19",
+        "raw_confocal_name": "confocal-thick-tissue_756772_2025-04-09",
+        "zstack_name": "ophys-z-stacks_756772_registered",
+        "zstack_masks_name": "ophys-z-stacks_756772_segmented"
+    },
+    "759003": {
+        "xenium_name": "Xenium_759003_2025-04-23",
+        "genotype": "Slc32a1-IRES-Cre;Oi1",
+        "sectioning_depth": 450,
+        "sections_thickness": 20
+    },
+    "778174": {
+        "xenium_name": "Xenium_778174_2025-05-07",
+        "genotype": "Snap25-IRES2-Cre;Oi4",
+        "sectioning_depth": 450,
+        "sections_thickness": 20
+    },
+    "770057": {
+        "xenium_name": "Xenium_770057_2025-07-17",
+        "genotype": "Slc32a1-IRES-Cre;Oi1",
+        "sectioning_depth": 450,
+        "sections_thickness": 20
+    },
+    "786297": {
+        "xenium_name": "Xenium_786297_2025-07-16",
+        "genotype": "Snap25-IRES2-Cre;Oi4",
+        "sectioning_depth": 450,
+        "sections_thickness": 20
+    },
+    "775682": {
+        "xenium_name": "Xenium_775682_2025-10-03",
+        "genotype": "Slc32a1-IRES-Cre;Oi1",
+        "sectioning_depth": 450,
+        "sections_thickness": 20
+    },
+    "779891": {
+        "xenium_name": "Xenium_779891_2025-10-03",
+        "genotype": "Slc32a1-IRES-Cre;Oi1",
+        "sectioning_depth": 450,
+        "sections_thickness": 20
+    },
+    "797371": {
+        "xenium_name": "Xenium_797371_2025-10-22",
+        "genotype": "Snap25-IRES2-Cre;Oi4",
+        "sectioning_depth": 600,
+        "sections_thickness": 20,
+        "confocal_name": "confocal-thick-tissue_797371_2025-09-25_processed_2026-01-06_23-00-58",
+        "raw_confocal_name": "confocal-thick-tissue_797371_2025-09-25",
+        "zstack_name": "ophys-z-stacks_797371_registered",
+        "zstack_masks_name": "ophys-z-stacks_797371_segmented"
+    },
+    "806644": {
+        "xenium_name": "Xenium_806644_2025-12-18",
+        "genotype": "Snap25-IRES2-Cre;Oi4",
+        "sectioning_depth": 600,
+        "sections_thickness": 20
+    },
+    "804670": {
+        "xenium_name": "Xenium_804670_2025-12-18",
+        "genotype": "Slc32a1-IRES-Cre;Oi1",
+        "sectioning_depth": 600,
+        "sections_thickness": 20
+    },
+    "810976": {
+        "xenium_name": "Xenium_810976_2026-02-07",
+        "genotype": "Snap25-IRES2-Cre;Oi4",
+        "sectioning_depth": 600,
+        "sections_thickness": 20
+    },
+    "816462": {
+        "xenium_name": "Xenium_816462_2026-02-07",
+        "genotype": "Snap25-IRES2-Cre;Oi4",
+        "sectioning_depth": 600,
+        "sections_thickness": 20
+    }
+}
+	
