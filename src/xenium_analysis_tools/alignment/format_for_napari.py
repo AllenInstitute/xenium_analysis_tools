@@ -110,15 +110,27 @@ def get_fov_sdata(
 
 def filter_transcripts(sdata, 
                         genes_to_show='all', 
-                        filter_is_gene=True,
-                        filter_assigned_to_cell=True, 
-                        min_qv=0,
-                        filter_transcripts_to_cells=True):
+                        filter_is_gene=False,
+                        filter_assigned_to_cell=False, 
+                        min_qv=20,
+                        filter_transcripts_to_cells=False,
+                        sections=[],
+                        add_prefix='',
+                        return_only=False):
+
+    if return_only:
+        tx_els = {}
     for tx_el in list(sdata.points.keys()):
         if not tx_el.startswith('transcripts'):
             continue
 
         tx = sdata.points[tx_el]
+
+        if sections:
+            tx_sec = np.unique(plot_sdata_fov['transcripts-3']['section'].compute())[0]
+            if tx_sec not in sections:
+                print(f"Skipping {tx_el} (section {tx_sec} not in filter list)")
+                continue
 
         # 1. Filter by gene name
         if genes_to_show != 'all' and 'feature_name' in tx.columns:
@@ -151,10 +163,17 @@ def filter_transcripts(sdata,
             cell_table = cell_table[cell_table.obs['section'] == s_n]
             tx = tx[tx['cell_id'].isin(cell_table.obs['cell_id'])]
 
-        sdata.points[tx_el] = tx
         print(f"{tx_el}: filters applied (lazy — will compute on render)")
+        if add_prefix:
+            tx_el = f"{add_prefix}_{tx_el}"
+        if return_only:
+            tx_els[tx_el] = tx
     
-    return sdata
+    if return_only:
+        return tx_els
+    else:
+        sdata.points[tx_el] = tx
+        return sdata
 
 def is_dask(df):
     return isinstance(df, dd.DataFrame)
@@ -988,3 +1007,74 @@ def add_napari_colormaps(
             )
 
     return sdata
+
+def make_column_colormap(
+    source,
+    column_name,
+    colors=None,
+    colormap_name='tab20',
+    default_color='#808080',
+    add_to_uns=False,
+):
+    import anndata as ad
+
+    # --- Extract the series ---
+    if isinstance(source, ad.AnnData):
+        series = source.obs[column_name]
+    elif isinstance(source, pd.Series):
+        series = source
+    else:
+        # dask or pandas DataFrame
+        series = source[column_name]
+
+    # --- Get unique categories ---
+    if hasattr(series, 'compute'):
+        # dask: use cat.as_known() if categorical, else compute unique
+        if hasattr(series, 'cat'):
+            categories = series.cat.as_known().cat.categories.tolist()
+        else:
+            categories = sorted(series.unique().compute().dropna().tolist())
+    else:
+        if hasattr(series, 'cat'):
+            categories = series.cat.categories.tolist()
+        else:
+            categories = sorted(series.dropna().unique().tolist())
+
+    # --- Build color mapping ---
+    cmap = plt.get_cmap(colormap_name, len(categories))
+    auto_colors = {cat: mcolors.to_hex(cmap(i)) for i, cat in enumerate(categories)}
+
+    # Override with any explicitly provided colors
+    color_map = {cat: colors.get(cat, auto_colors.get(cat, default_color))
+                 for cat in categories}
+    if colors:
+        color_map.update({k: v for k, v in colors.items() if k in color_map})
+
+    # --- Optionally write back to AnnData uns ---
+    if add_to_uns:
+        if not isinstance(source, ad.AnnData):
+            raise ValueError("add_to_uns requires an AnnData source")
+        if not hasattr(series, 'cat'):
+            source.obs[column_name] = pd.Categorical(source.obs[column_name])
+        source.uns[f'{column_name}_colors'] = [
+            color_map[cat] for cat in source.obs[column_name].cat.categories
+        ]
+
+    return color_map
+    
+def recolor_tx_layer(viewer, el_name, sdata, color_col, colors_dict=None, cmap='tab20'):
+    tx_layer = viewer.layers[el_name]
+    tx_colors = make_column_colormap(
+        sdata[el_name],
+        color_col,
+        colors=colors_dict,
+        colormap_name=cmap,
+    )
+    tx_data = sdata[el_name][color_col].compute()
+    tx_fns = tx_data.values
+    tx_layer.properties = {
+        **tx_layer.properties,
+        color_col: tx_fns,
+    }
+    tx_layer.face_color_cycle = tx_colors 
+    tx_layer.face_color = color_col   
