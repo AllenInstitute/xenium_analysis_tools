@@ -10,6 +10,8 @@ import dask.dataframe as dd
 import xarray as xr
 from xenium_analysis_tools.alignment.align_sections import _get_lifted_element_transforms
 import dask.dataframe as dd
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 
 def filter_labels(sdata, label_elements='cell_labels', table='table', key_col='cell_labels'):
     # Get all label elements that match the specified prefix
