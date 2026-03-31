@@ -123,13 +123,14 @@ def filter_transcripts(sdata,
     if return_only:
         tx_els = {}
     for tx_el in list(sdata.points.keys()):
+        print(f'Filtering {tx_el}...')
         if not tx_el.startswith('transcripts'):
             continue
 
         tx = sdata.points[tx_el]
 
         if sections:
-            tx_sec = np.unique(plot_sdata_fov['transcripts-3']['section'].compute())[0]
+            tx_sec = np.unique(tx['section'].compute())[0]
             if tx_sec not in sections:
                 print(f"Skipping {tx_el} (section {tx_sec} not in filter list)")
                 continue
@@ -170,11 +171,12 @@ def filter_transcripts(sdata,
             tx_el = f"{add_prefix}_{tx_el}"
         if return_only:
             tx_els[tx_el] = tx
+        else:
+            sdata.points[tx_el] = tx  
     
     if return_only:
         return tx_els
     else:
-        sdata.points[tx_el] = tx
         return sdata
 
 def is_dask(df):
