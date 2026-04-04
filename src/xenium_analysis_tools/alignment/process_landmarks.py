@@ -64,33 +64,6 @@ _DIHEDRAL_TRANSFORMS = [
         lambda x, y, H, W: (W - 1 - y, H - 1 - x)),
 ]
 
-####### Functions to handle landmarks #########
-# def get_biwarp_params(bigwarp_json_path):
-#     import json
-#     with open(bigwarp_json_path, 'r') as f:
-#         bw_json = json.load(f)
-#     for source, source_data in bw_json['Sources'].items():
-#         if source_data['isMoving']:
-#             if 'confocal' in source_data['uri'].lower():
-#                 continue
-#             moving_image_path = Path(source_data['uri'])
-#             if moving_image_path.name=='?':
-#                 moving_image_path = moving_image_path.parent
-#         else:
-#             reference_image_path = Path(source_data['uri'])
-#             if reference_image_path.name=='?':
-#                 reference_image_path = reference_image_path.parent
-#     if 'zstack' in moving_image_path.name.lower() or 'z_stack' in moving_image_path.name.lower():
-#         moving_image = 'czstack'
-#         reference_image = 'xenium_section'
-#     transform_type = bw_json['Transform']['type']
-#     bigwarp_params = {'moving_image': moving_image,
-#                     'reference_image': reference_image,
-#                     'moving_image_path': moving_image_path,
-#                     'reference_image_path': reference_image_path,
-#                     'transform_type': transform_type}
-#     return bigwarp_params
-
 def get_bigwarp_params(bigwarp_json_path):
     with open(bigwarp_json_path, 'r') as f:
         bw_json = json.load(f)
@@ -133,24 +106,6 @@ def remove_landmark_buffer(landmarks, czstack_buffer=None, xenium_buffer=None):
         landmarks['xenium_x'] = landmarks['xenium_x'] - xenium_buffer.get('x', 0)
         landmarks['xenium_z'] = landmarks['xenium_z'] - xenium_buffer.get('z', 0)
     return landmarks
-
-# def get_section_landmarks(landmarks_path, dims_order=['x','y','z'], bigwarp_project_path=None, moving_img=None):
-#     if bigwarp_project_path is not None:
-#         bigwarp_params = get_biwarp_params(bigwarp_project_path)
-#     elif moving_img is not None:
-#         bigwarp_params = {'moving_image': moving_img}
-#     else:
-#         print("No BigWarp project path or moving image specified - assuming czstack was moving image")
-#         bigwarp_params = {'moving_image': 'czstack'}
-#     print(f"Loading landmarks from: {landmarks_path}")
-#     landmarks = pd.read_csv(landmarks_path, header=None)
-#     if bigwarp_params['moving_image']=='czstack':
-#         # Flatten the lists using + operator to concatenate them
-#         landmarks.columns = ['landmark_name', 'active'] + [f'czstack_{dim}' for dim in dims_order] + [f'xenium_{dim}' for dim in dims_order]
-#     else:
-#         landmarks.columns = ['landmark_name', 'active'] + [f'xenium_{dim}' for dim in dims_order] + [f'czstack_{dim}' for dim in dims_order]
-
-#     return landmarks, bigwarp_params
 
 def get_section_landmarks(landmarks_path=None, dims_order=['x','y','z'], bigwarp_project_path=None, moving_img=None):
     if landmarks_path is not None:
@@ -587,59 +542,6 @@ def manual_landmarks_transform(s_n, sdata_path, landmarks_path, landmarked_image
     )
 
     return parsed_lm
-
-# def _process_section(s_n, paths, alignment_params):
-#     """Process landmarks for one section. Returns (s_n, landmarks) or (s_n, None).
-
-#     Designed to run concurrently: each section reads its own independent files
-#     (BigWarp JSON, landmarked TIFF, zarr), so there are no shared-state conflicts.
-#     plot_imgs=False keeps matplotlib out of worker threads (not thread-safe).
-#     """
-#     bigwarp_folder_path = (paths['data_root']
-#                            / alignment_params['bigwarp_projects_folder']
-#                            / alignment_params['bigwarp_projects_names_fn'](s_n))
-#     landmarked_image_path = (paths['data_root']
-#                               / alignment_params['landmarked_images_folder']
-#                               / alignment_params['landmarked_images_names_fn'](s_n))
-#     images_folder_path = (paths['data_root']
-#                               / alignment_params['landmarked_images_folder']
-#                               / alignment_params['landmarked_images_names_fn'](s_n))                
-#     sdata_path = paths['sdata_path'] / f"section_{s_n}.zarr"
-
-#     # ── Early-exit: check all files before any heavy I/O ──────────────────
-#     if not bigwarp_folder_path.exists():
-#         print(f"  Section {s_n}: BigWarp project not found at {bigwarp_folder_path}, skipping")
-#         return s_n, None
-#     if not landmarked_image_path.exists():
-#         print(f"  Section {s_n}: landmarked image not found at {landmarked_image_path}, skipping")
-#         return s_n, None
-
-#     bigwarp_params, lm_df = extract_bigwarp_params(bigwarp_folder_path)
-#     if lm_df is None or lm_df.empty:
-#         print(f"  Section {s_n}: no landmarks in BigWarp project, looking for landmarks path...")
-#         landmarks_path = (paths['data_root']
-#                            / alignment_params['landmarks_folder']
-#                            / alignment_params['landmarks_folder_names_fn'](s_n))
-#         if not landmarks_path.exists():
-#             print(f"  Section {s_n}: landmarks not found at {landmarks_path}, skipping")
-#             return s_n, None
-#         print(f"  Manually transforming landmarks...")
-
-#     else:
-#         print(f"Formatting section {s_n} landmarks")
-#         transform_info, landmarks_out = find_landmarked_img_transforms(
-#             landmarked_image_path=landmarked_image_path,
-#             sdata_path=sdata_path,
-#             landmarks=lm_df,
-#             plot_imgs=False,                         
-#             save_imgs_path=imgs_folder / f"section_{s_n}.png",
-#         )
-#         if landmarks_out is None:
-#             return s_n, None
-#         else:
-#             formatted_landmarks = parse_landmarks(landmarks_out, transform_info)
-
-#     return s_n, formatted_landmarks
 
 def get_section_landmarks_threads(xenium_section_ns, paths, alignment_params, n_workers=None):
     from concurrent.futures import ThreadPoolExecutor, as_completed
