@@ -64,31 +64,6 @@ _DIHEDRAL_TRANSFORMS = [
         lambda x, y, H, W: (W - 1 - y, H - 1 - x)),
 ]
 
-def get_bigwarp_params(bigwarp_json_path):
-    with open(bigwarp_json_path, 'r') as f:
-        bw_json = json.load(f)
-    for source, source_data in bw_json['Sources'].items():
-        if source_data['isMoving']:
-            if 'confocal' in source_data['uri'].lower():
-                continue
-            moving_image_path = Path(source_data['uri'])
-            if moving_image_path.name=='?':
-                moving_image_path = moving_image_path.parent
-        else:
-            reference_image_path = Path(source_data['uri'])
-            if reference_image_path.name=='?':
-                reference_image_path = reference_image_path.parent
-    if 'zstack' in moving_image_path.name.lower() or 'z_stack' in moving_image_path.name.lower():
-        moving_image = 'czstack'
-        reference_image = 'xenium_section'
-    transform_type = bw_json['Transform']['type']
-    bigwarp_params = {'moving_image': moving_image,
-                    'reference_image': reference_image,
-                    'moving_image_path': moving_image_path,
-                    'reference_image_path': reference_image_path,
-                    'transform_type': transform_type}
-    return bigwarp_params
-
 def invert_xenium_y_landmarks(landmarks, landmarked_image_path):
     with tifffile.TiffFile(landmarked_image_path) as tif:
         landmarked_image_shape = tif.pages[0].shape
@@ -106,28 +81,6 @@ def remove_landmark_buffer(landmarks, czstack_buffer=None, xenium_buffer=None):
         landmarks['xenium_x'] = landmarks['xenium_x'] - xenium_buffer.get('x', 0)
         landmarks['xenium_z'] = landmarks['xenium_z'] - xenium_buffer.get('z', 0)
     return landmarks
-
-def get_section_landmarks(landmarks_path=None, dims_order=['x','y','z'], bigwarp_project_path=None, moving_img=None):
-    if landmarks_path is not None:
-        if bigwarp_project_path is not None:
-            bigwarp_params = get_bigwarp_params(bigwarp_project_path)
-        elif moving_img is not None:
-            bigwarp_params = {'moving_image': moving_img}
-        else:
-            print("No BigWarp project path or moving image specified - assuming czstack was moving image")
-            bigwarp_params = {'moving_image': 'czstack'}
-        print(f"Loading landmarks from: {landmarks_path}")
-        landmarks = pd.read_csv(landmarks_path, header=None)
-        if bigwarp_params['moving_image']=='czstack':
-            # Flatten the lists using + operator to concatenate them
-            landmarks.columns = ['landmark_name', 'active'] + [f'czstack_{dim}' for dim in dims_order] + [f'xenium_{dim}' for dim in dims_order]
-        else:
-            landmarks.columns = ['landmark_name', 'active'] + [f'xenium_{dim}' for dim in dims_order] + [f'czstack_{dim}' for dim in dims_order]
-    else:
-        landmarks = None
-        bigwarp_params = None
-
-    return landmarks, bigwarp_params
 
 def _normalize_bw_uri(uri):
     """Normalize a BigWarp source URI to a Path.
@@ -301,6 +254,90 @@ def plot_img_landmark_transforms(sdata_img,
         plt.show()
     else:
         plt.close(fig)
+
+
+def plot_manual_landmark_transforms(landmarks_before,
+                                    landmarks_after,
+                                    landmarked_image_path,
+                                    sdata,
+                                    landmarks_tf_info=None,
+                                    section=None,
+                                    save_path=None,
+                                    show=True):
+    """Visualise the manual landmark coordinate transform.
+
+    Two-panel figure:
+      Left  — landmarked TIFF with original (xenium_x, xenium_y) landmarks in
+              landmarked-image pixel space.
+      Right — sdata ``morphology_focus`` (full resolution) with transformed
+              (xenium_x, xenium_y) landmarks mapped into sdata pixel space,
+              after all scaling / inversion / bbox-offset corrections.
+
+    Parameters
+    ----------
+    landmarks_before : pd.DataFrame
+        CSV-loaded landmark table with ``xenium_x``, ``xenium_y`` columns in
+        landmarked-image pixel space (before any coordinate correction).
+    landmarks_after : pd.DataFrame
+        Same table after coordinate corrections (scaling, inversion, offset)
+        but *before* the column rename to ``x``/``y``.  Still has
+        ``xenium_x``/``xenium_y`` columns, now in sdata pixel space.
+    landmarked_image_path : Path or str
+        TIFF that was used for BigWarp landmarking.
+    sdata : SpatialData
+        Section SpatialData object (already loaded).
+    landmarks_tf_info : dict or None
+        Dict returned by ``get_landmarked_image_props``.  Used to annotate
+        scale factors and bbox offset on the right panel.
+    section : int or str, optional
+        Section number used as figure suptitle.
+    save_path : Path or str, optional
+    show : bool
+        Display inline.  Set ``False`` when called from a worker thread.
+    """
+    # ── Load landmarked TIFF ──────────────────────────────────────────────
+    with tifffile.TiffFile(landmarked_image_path) as tif:
+        lm_stack = tif.asarray()
+    lm_img = lm_stack if lm_stack.ndim == 2 else lm_stack[1]
+
+    # ── Load sdata morphology at full resolution ──────────────────────────
+    morph     = sdata['morphology_focus']
+    sdata_img = np.asarray(sd.get_pyramid_levels(morph, n=0)[1])
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    # ── Left: landmarked image + original landmarks ───────────────────────
+    axes[0].imshow(lm_img, cmap='gray')
+    if 'xenium_x' in landmarks_before.columns:
+        axes[0].scatter(landmarks_before['xenium_x'], landmarks_before['xenium_y'],
+                        c='red', s=15, zorder=5)
+    axes[0].set_title('Landmarked image  +  original landmarks (image pixel space)')
+
+    # ── Right: sdata image + transformed landmarks ────────────────────────
+    axes[1].imshow(sdata_img, cmap='gray')
+    axes[1].scatter(landmarks_after['xenium_x'], landmarks_after['xenium_y'],
+                    c='red', s=15, zorder=5)
+    subtitle = 'sdata morphology_focus (scale0)  +  transformed landmarks'
+    if landmarks_tf_info is not None:
+        sx   = landmarks_tf_info.get('scale_factor_x')
+        sy   = landmarks_tf_info.get('scale_factor_y')
+        bbox = landmarks_tf_info.get('bbox')
+        if sx is not None and sy is not None:
+            subtitle += f'\nscale (x, y): ({sx:.3f}, {sy:.3f})'
+        if bbox is not None:
+            subtitle += f'  |  bbox offset: ({bbox["x_min"]}, {bbox["y_min"]})'
+    axes[1].set_title(subtitle)
+
+    plt.tight_layout()
+    if section is not None:
+        plt.suptitle(f'Section: {section}', y=1.01)
+    if save_path is not None:
+        plt.savefig(save_path, bbox_inches='tight')
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
 
 def find_landmarked_img_transforms(landmarked_image_path, 
                                     sdata_path, 
@@ -486,13 +523,20 @@ def _process_section(s_n, paths, alignment_params):
             print(f"  Section {s_n}: landmarks not found at {landmarks_path}, skipping")
             return s_n, None
         print(f"  Manually transforming landmarks...")
-        landmarked_image_path = paths['data_root'] / alignment_params['landmarked_images_folder'] / alignment_params['landmarked_images_names_fn'](s_n)
-        formatted_landmarks = manual_landmarks_transform(s_n=s_n, 
-                                                        sdata_path=sdata_path, 
-                                                        landmarks_path=landmarks_path,
-                                                        landmarked_image_path=landmarked_image_path, 
-                                                        alignment_params=alignment_params, 
-                                                        bigwarp_params=bigwarp_params)
+        landmarked_image_path = (paths['data_root']
+                                 / alignment_params['landmarked_images_folder']
+                                 / alignment_params['landmarked_images_names_fn'](s_n))
+        val_folder = alignment_params.get('validation_images_folder')
+        save_imgs_path = val_folder / f"section_{s_n}_manual.png" if val_folder is not None else None
+        formatted_landmarks = manual_landmarks_transform(
+            s_n=s_n,
+            sdata_path=sdata_path,
+            landmarks_path=landmarks_path,
+            landmarked_image_path=landmarked_image_path,
+            alignment_params=alignment_params,
+            bigwarp_params=bigwarp_params,
+            save_imgs_path=save_imgs_path,
+        )
 
     else:
         print(f"Formatting section {s_n} landmarks")
@@ -511,36 +555,59 @@ def _process_section(s_n, paths, alignment_params):
     return s_n, formatted_landmarks
 
 
-def manual_landmarks_transform(s_n, sdata_path, landmarks_path, landmarked_image_path, alignment_params, bigwarp_params, dims_order=['x','y','z']):
-    starting_lm_df = pd.read_csv(landmarks_path, header=None)
-    if bigwarp_params['moving_image_dataset']=='czstack':
-        starting_lm_df.columns = ['landmark_name', 'active'] + [f'czstack_{dim}' for dim in dims_order] + [f'xenium_{dim}' for dim in dims_order]
-    else:
-        starting_lm_df.columns = ['landmark_name', 'active'] + [f'xenium_{dim}' for dim in dims_order] + [f'czstack_{dim}' for dim in dims_order]
+def manual_landmarks_transform(s_n, sdata_path, landmarks_path, landmarked_image_path,
+                               alignment_params, bigwarp_params,
+                               dims_order=['x', 'y', 'z'],
+                               save_imgs_path=None):
+    # ── Read sdata once — needed for pixel size and get_landmarked_image_props ──
+    sdata = sd.read_zarr(sdata_path)
+    full_scale_pixel_size = sdata['table'].uns['section_metadata']['pixel_size']
 
-    landmarks_out = starting_lm_df.copy()
-    if alignment_params.get('czstack_buffer', None) is not None:
-        landmarks_out = remove_landmark_buffer(landmarks_out, czstack_buffer=alignment_params['czstack_buffer'])   
-    
-    if alignment_params.get('fix_cropped_landmarks', None) and landmarked_image_path is not None:
-        landmarks_out, landmarks_info = get_landmarked_image_props(
-                            landmarked_image_path, 
-                            sdata_path, 
-                            landmarks_out, 
-                            s_n,
-                            invert_y=alignment_params.get('invert_lm_y', None))
-    elif alignment_params.get('invert_lm_y', None) and landmarked_image_path is not None:
+    starting_lm_df = pd.read_csv(landmarks_path, header=None)
+    if bigwarp_params['moving_image_dataset'] == 'czstack':
+        starting_lm_df.columns = (['landmark_name', 'active']
+                                   + [f'czstack_{d}' for d in dims_order]
+                                   + [f'xenium_{d}'  for d in dims_order])
+    else:
+        starting_lm_df.columns = (['landmark_name', 'active']
+                                   + [f'xenium_{d}'  for d in dims_order]
+                                   + [f'czstack_{d}' for d in dims_order])
+
+    landmarks_out    = starting_lm_df.copy()
+    landmarks_tf_info = None
+
+    if alignment_params.get('czstack_buffer') is not None:
+        landmarks_out = remove_landmark_buffer(
+            landmarks_out, czstack_buffer=alignment_params['czstack_buffer'])
+
+    if alignment_params.get('fix_cropped_landmarks', False) and landmarked_image_path is not None:
+        landmarks_out, landmarks_tf_info = get_landmarked_image_props(
+            landmarked_image_path, sdata, landmarks_out, s_n,
+            invert_y=alignment_params.get('invert_lm_y', False))
+    elif alignment_params.get('invert_lm_y', False) and landmarked_image_path is not None:
         landmarks_out = invert_xenium_y_landmarks(landmarks_out, landmarked_image_path)
-    landmarks_out = landmarks_out.rename(columns={'xenium_x': 'x', 'xenium_y': 'y', 'xenium_z': 'z'})
-    full_scale_pixel_size = landmarks_info.get('full_scale_pixel_size')
+
+    if save_imgs_path is not None:
+        plot_manual_landmark_transforms(
+            landmarks_before=starting_lm_df,
+            landmarks_after=landmarks_out,
+            landmarked_image_path=landmarked_image_path,
+            sdata=sdata,
+            landmarks_tf_info=landmarks_tf_info,
+            section=s_n,
+            save_path=save_imgs_path,
+            show=False,
+        )
+
+    landmarks_out = landmarks_out.rename(
+        columns={'xenium_x': 'x', 'xenium_y': 'y', 'xenium_z': 'z'})
     parsed_lm = PointsModel.parse(landmarks_out)
     set_transformation(parsed_lm, Identity(), to_coordinate_system='global')
     set_transformation(
         parsed_lm,
         Scale([full_scale_pixel_size, full_scale_pixel_size], axes=('x', 'y')),
-        to_coordinate_system='microns'
+        to_coordinate_system='microns',
     )
-
     return parsed_lm
 
 def get_section_landmarks_threads(xenium_section_ns, paths, alignment_params, n_workers=None):
@@ -741,49 +808,4 @@ def get_landmarked_image_props(landmarked_image_path, sdata, landmarks,
                          'fullres_pixel_size': sdata['table'].uns['section_metadata']['pixel_size']}
 
     return landmarks, landmarks_tf_info
-
-def format_landmarks(sdata_path, 
-                    landmarks_path, 
-                    section_n, 
-                    bigwarp_project_paths=None,
-                    moving_img=None,
-                    czstack_buffer=None,
-                    invert_lm_y=False, 
-                    fix_cropped_landmarks=False,
-                    landmarked_image_path=None,
-                    dims_order=['x','y','z']):
-    sdata = sd.read_zarr(sdata_path)
-    landmarks, bigwarp_params = get_section_landmarks(
-                                    landmarks_path=landmarks_path, 
-                                    bigwarp_project_path=bigwarp_project_paths,
-                                    moving_img=moving_img,
-                                    dims_order=dims_order)
-
-    if czstack_buffer is not None:
-        landmarks = remove_landmark_buffer(landmarks, 
-                                            czstack_buffer=czstack_buffer)
-
-    # if fix_cropped_landmarks and landmarked_image_path is not None:
-        # invert_y is handled inside get_landmarked_image_props at the right point
-    landmarks, landmarks_tf_info = get_landmarked_image_props(
-                        landmarked_image_path, 
-                        sdata, 
-                        landmarks, 
-                        section_n,
-                        invert_y=invert_lm_y)
-    # elif invert_lm_y and landmarked_image_path is not None:
-    #     # sections where fix_cropped_landmarks=False
-    #     landmarks = invert_xenium_y_landmarks(landmarks, landmarked_image_path)
-
-    # Adjust landmarks resolutions
-    full_scale_pixel_size = landmarks_tf_info['fullres_pixel_size']
-    landmarks = landmarks.rename(columns={'xenium_x': 'x', 'xenium_y': 'y', 'xenium_z': 'z'})
-    landmarks = PointsModel.parse(landmarks)
-    set_transformation(landmarks, Identity(), to_coordinate_system='global')
-    set_transformation(
-        landmarks,
-        Scale([full_scale_pixel_size, full_scale_pixel_size], axes=('x', 'y')),
-        to_coordinate_system='microns'
-    )
-    return landmarks
 
