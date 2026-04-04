@@ -19,7 +19,13 @@ import time
 from spatialdata._io._utils import _resolve_zarr_store
 from tqdm.notebook import tqdm
 import json
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Matplotlib's pyplot interface is NOT thread-safe.  All plot functions that
+# may be called from worker threads must acquire this lock before touching any
+# plt.* state.
+_MATPLOTLIB_LOCK = threading.Lock()
 
 from spatialdata.transformations import (
     get_transformation,
@@ -225,6 +231,14 @@ def plot_img_landmark_transforms(sdata_img,
         in a background thread (matplotlib is not thread-safe) or in batch mode
         to avoid blocking; the figure is saved to ``save_path`` and then closed.
     """
+    with _MATPLOTLIB_LOCK:
+      _plot_img_landmark_transforms_inner(
+          sdata_img, lm_img, best_transformed_img, transform_info,
+          landmarks, landmarks_out, section, save_path, show)
+
+def _plot_img_landmark_transforms_inner(sdata_img, lm_img, best_transformed_img,
+                                        transform_info, landmarks, landmarks_out,
+                                        section, save_path, show):
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     axes[0].imshow(lm_img, cmap='gray')
     if landmarks is not None:
@@ -260,6 +274,7 @@ def plot_manual_landmark_transforms(landmarks_before,
                                     landmarks_after,
                                     landmarked_image_path,
                                     sdata,
+                                    ch=0,
                                     landmarks_tf_info=None,
                                     section=None,
                                     save_path=None,
@@ -301,14 +316,16 @@ def plot_manual_landmark_transforms(landmarks_before,
     # means the first axis is height, i.e. (H, W) or (H, W, C).
     with tifffile.TiffFile(landmarked_image_path) as tif:
         lm_stack = tif.asarray()
+    # Disambiguate (C, H, W) vs (H, W, C): a small leading dimension (≤8)
+    # means channel-first; a large one means height is axis 0.
     if lm_stack.ndim == 2:
         lm_img = lm_stack
     elif lm_stack.ndim == 3 and lm_stack.shape[0] <= 8:   # (C, H, W)
-        lm_img = lm_stack[min(1, lm_stack.shape[0] - 1)]
+        lm_img = lm_stack[min(ch, lm_stack.shape[0] - 1)]
     elif lm_stack.ndim == 3:                               # (H, W, C)
-        lm_img = lm_stack[:, :, min(1, lm_stack.shape[2] - 1)]
-    else:                                                  # unexpected shape — take first plane
-        lm_img = lm_stack.reshape(-1, lm_stack.shape[-2], lm_stack.shape[-1])[0]
+        lm_img = lm_stack[:, :, min(ch, lm_stack.shape[2] - 1)]
+    else:
+        lm_img = lm_stack.reshape(-1, lm_stack.shape[-2], lm_stack.shape[-1])[ch]
 
     # ── Load sdata morphology at a downsampled level for speed ────────────
     # Full-res (n=0) can be 4k–8k px and is slow to materialise; a lower
@@ -326,41 +343,42 @@ def plot_manual_landmark_transforms(landmarks_before,
     scale_y = sdata_img.shape[0] / full_res_shape[0]
     scale_x = sdata_img.shape[1] / full_res_shape[1]
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    with _MATPLOTLIB_LOCK:
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
-    # ── Left: landmarked image + original landmarks ───────────────────────
-    axes[0].imshow(lm_img, cmap='gray')
-    if 'xenium_x' in landmarks_before.columns:
-        axes[0].scatter(landmarks_before['xenium_x'], landmarks_before['xenium_y'],
+        # ── Left: landmarked image + original landmarks ───────────────────
+        axes[0].imshow(lm_img, cmap='gray')
+        if 'xenium_x' in landmarks_before.columns:
+            axes[0].scatter(landmarks_before['xenium_x'], landmarks_before['xenium_y'],
+                            c='red', s=15, zorder=5)
+        axes[0].set_title('Landmarked image  +  original landmarks (image pixel space)')
+
+        # ── Right: sdata image + transformed landmarks ────────────────────
+        # Scale landmark coordinates from full-res pixel space to display level.
+        axes[1].imshow(sdata_img, cmap='gray')
+        axes[1].scatter(landmarks_after['xenium_x'] * scale_x,
+                        landmarks_after['xenium_y'] * scale_y,
                         c='red', s=15, zorder=5)
-    axes[0].set_title('Landmarked image  +  original landmarks (image pixel space)')
+        subtitle = 'sdata morphology_focus (scale0)  +  transformed landmarks'
+        if landmarks_tf_info is not None:
+            sx   = landmarks_tf_info.get('scale_factor_x')
+            sy   = landmarks_tf_info.get('scale_factor_y')
+            bbox = landmarks_tf_info.get('bbox')
+            if sx is not None and sy is not None:
+                subtitle += f'\nscale (x, y): ({sx:.3f}, {sy:.3f})'
+            if bbox is not None:
+                subtitle += f'  |  bbox offset: ({bbox["x_min"]}, {bbox["y_min"]})'
+        axes[1].set_title(subtitle)
 
-    # ── Right: sdata image + transformed landmarks ────────────────────────
-    # Scale landmark coordinates from full-res pixel space to display level.
-    axes[1].imshow(sdata_img, cmap='gray')
-    axes[1].scatter(landmarks_after['xenium_x'] * scale_x,
-                    landmarks_after['xenium_y'] * scale_y,
-                    c='red', s=15, zorder=5)
-    subtitle = 'sdata morphology_focus (scale0)  +  transformed landmarks'
-    if landmarks_tf_info is not None:
-        sx   = landmarks_tf_info.get('scale_factor_x')
-        sy   = landmarks_tf_info.get('scale_factor_y')
-        bbox = landmarks_tf_info.get('bbox')
-        if sx is not None and sy is not None:
-            subtitle += f'\nscale (x, y): ({sx:.3f}, {sy:.3f})'
-        if bbox is not None:
-            subtitle += f'  |  bbox offset: ({bbox["x_min"]}, {bbox["y_min"]})'
-    axes[1].set_title(subtitle)
-
-    plt.tight_layout()
-    if section is not None:
-        plt.suptitle(f'Section: {section}', y=1.01)
-    if save_path is not None:
-        plt.savefig(save_path, bbox_inches='tight')
-    if show:
-        plt.show()
-    else:
-        plt.close(fig)
+        plt.tight_layout()
+        if section is not None:
+            plt.suptitle(f'Section: {section}', y=1.01)
+        if save_path is not None:
+            plt.savefig(save_path, bbox_inches='tight')
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
 
 def find_landmarked_img_transforms(landmarked_image_path, 
                                     sdata_path, 
@@ -644,11 +662,19 @@ def get_section_landmarks_threads(xenium_section_ns, paths, alignment_params, n_
             pool.submit(_process_section, s_n, paths, alignment_params): s_n
             for s_n in xenium_section_ns
         }
+        failed = []
         for fut in tqdm(as_completed(futures), total=len(futures),
                         desc='Processing sections', unit='section'):
-            s_n, lm = fut.result()
-            if lm is not None:
-                sections_landmarks[s_n] = lm
+            s_n = futures[fut]
+            try:
+                s_n_result, lm = fut.result()
+                if lm is not None:
+                    sections_landmarks[s_n_result] = lm
+            except Exception as exc:
+                failed.append(s_n)
+                print(f"  Section {s_n}: FAILED with {type(exc).__name__}: {exc}")
+        if failed:
+            print(f"\nWarning: {len(failed)} section(s) failed: {sorted(failed)}")
     return sections_landmarks
 
 # ── Affine comparison helpers ─────────────────────────────────────────────────
