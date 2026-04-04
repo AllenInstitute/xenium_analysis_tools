@@ -92,11 +92,39 @@ def get_fov_sdata(
         else:
             filtered_points[el] = pts
 
+    # spatialdata's bounding_box_query does not support "case 2":
+    # a 2D element (data_dim=2) with a 3D lifting transformation (rank-2 map to 3D
+    # czstack space, transform_coordinate_length=3).  Such elements come from 2D
+    # Xenium section images/labels that align_section_to_zstack registered in the
+    # czstack_microns coordinate system.  They don't need spatial filtering here
+    # (they are already precisely placed in czstack space), so we remove them
+    # before the bounding-box query and re-attach them afterwards.
+    def _is_2d_element(el):
+        """Return True if the element has no 'z' spatial dimension."""
+        if hasattr(el, 'dims'):
+            return 'z' not in el.dims
+        if hasattr(el, 'keys'):   # DataTree / multiscale
+            try:
+                lvl = next(iter(el.keys()))
+                node = el[lvl]
+                dims = node.dims if hasattr(node, 'dims') else getattr(node, 'image', node).dims
+                return 'z' not in dims
+            except Exception:
+                pass
+        return False
+
+    images_2d = {k: v for k, v in sdata.images.items() if _is_2d_element(v)}
+    labels_2d = {k: v for k, v in sdata.labels.items() if _is_2d_element(v)}
+
     # Query non-point elements with bounding box, then attach filtered points.
     points_backup = {k: sdata.points[k] for k in list(sdata.points.keys())}
     try:
         for el in list(sdata.points.keys()):
             del sdata.points[el]
+        for el in images_2d:
+            del sdata.images[el]
+        for el in labels_2d:
+            del sdata.labels[el]
 
         fov_data = sdata.query.bounding_box(
             axes=['z', 'y', 'x'],
@@ -106,7 +134,14 @@ def get_fov_sdata(
         )
     finally:
         sdata.points = points_backup
+        sdata.images.update(images_2d)
+        sdata.labels.update(labels_2d)
 
+    # Re-attach 2D section elements and filtered points.
+    # 2D elements are already precisely registered in czstack_microns space via
+    # their lifting transform, so no additional spatial filtering is needed.
+    fov_data.images.update(images_2d)
+    fov_data.labels.update(labels_2d)
     fov_data.points = filtered_points
     return fov_data
 
