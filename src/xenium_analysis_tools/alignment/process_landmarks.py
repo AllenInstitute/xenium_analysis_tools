@@ -296,13 +296,35 @@ def plot_manual_landmark_transforms(landmarks_before,
         Display inline.  Set ``False`` when called from a worker thread.
     """
     # ── Load landmarked TIFF ──────────────────────────────────────────────
+    # Handle both channel-first (C, H, W) and channel-last (H, W, C) TIFFs.
+    # A small first dimension (≤8) reliably indicates (C, H, W); a large one
+    # means the first axis is height, i.e. (H, W) or (H, W, C).
     with tifffile.TiffFile(landmarked_image_path) as tif:
         lm_stack = tif.asarray()
-    lm_img = lm_stack if lm_stack.ndim == 2 else lm_stack[1]
+    if lm_stack.ndim == 2:
+        lm_img = lm_stack
+    elif lm_stack.ndim == 3 and lm_stack.shape[0] <= 8:   # (C, H, W)
+        lm_img = lm_stack[min(1, lm_stack.shape[0] - 1)]
+    elif lm_stack.ndim == 3:                               # (H, W, C)
+        lm_img = lm_stack[:, :, min(1, lm_stack.shape[2] - 1)]
+    else:                                                  # unexpected shape — take first plane
+        lm_img = lm_stack.reshape(-1, lm_stack.shape[-2], lm_stack.shape[-1])[0]
 
-    # ── Load sdata morphology at full resolution ──────────────────────────
-    morph     = sdata['morphology_focus']
-    sdata_img = np.asarray(sd.get_pyramid_levels(morph, n=0)[1])
+    # ── Load sdata morphology at a downsampled level for speed ────────────
+    # Full-res (n=0) can be 4k–8k px and is slow to materialise; a lower
+    # level is sufficient for a diagnostic overlay. Landmarks are in full-res
+    # pixel space, so we compute scale factors to map them to display space.
+    morph    = sdata['morphology_focus']
+    n_scales = len(list(morph.keys()))
+    disp_lvl = min(2, n_scales - 1)
+    disp_da  = sd.get_pyramid_levels(morph, n=disp_lvl)
+    n_ch     = disp_da.shape[0]
+    sdata_img = np.asarray(disp_da[min(1, n_ch - 1)])
+
+    # Scale factors: full-res → display level (dask shape is cheap to read)
+    full_res_shape = sd.get_pyramid_levels(morph, n=0).shape[-2:]  # (H, W), lazy
+    scale_y = sdata_img.shape[0] / full_res_shape[0]
+    scale_x = sdata_img.shape[1] / full_res_shape[1]
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
@@ -314,8 +336,10 @@ def plot_manual_landmark_transforms(landmarks_before,
     axes[0].set_title('Landmarked image  +  original landmarks (image pixel space)')
 
     # ── Right: sdata image + transformed landmarks ────────────────────────
+    # Scale landmark coordinates from full-res pixel space to display level.
     axes[1].imshow(sdata_img, cmap='gray')
-    axes[1].scatter(landmarks_after['xenium_x'], landmarks_after['xenium_y'],
+    axes[1].scatter(landmarks_after['xenium_x'] * scale_x,
+                    landmarks_after['xenium_y'] * scale_y,
                     c='red', s=15, zorder=5)
     subtitle = 'sdata morphology_focus (scale0)  +  transformed landmarks'
     if landmarks_tf_info is not None:
@@ -337,7 +361,6 @@ def plot_manual_landmark_transforms(landmarks_before,
         plt.show()
     else:
         plt.close(fig)
-
 
 def find_landmarked_img_transforms(landmarked_image_path, 
                                     sdata_path, 
