@@ -39,6 +39,33 @@ from xenium_analysis_tools.utils.sd_utils import (
     add_micron_coord_sys,
 )
 
+# def _is_multiscale(element):
+#     return (
+#         hasattr(element, 'keys')
+#         and callable(element.keys)
+#         and not isinstance(element, GeoDataFrame)
+#     )
+
+# def get_microns_scales(sdata, element_name):
+#     el = sdata[element_name]
+#     if _is_multiscale(el):
+#         img = sd.get_pyramid_levels(el, n=0)
+#         img = img.image if hasattr(img, 'image') else img
+#     else:
+#         img = el.image if hasattr(el, 'image') else el
+
+#     # Get transforms from the actual image DataArray, not the DataTree
+#     el_transforms = get_transformation(img, get_all=True)
+#     microns_tf = el_transforms.get('microns', None)
+#     if microns_tf is None:
+#         ps = sdata['table'].uns['section_metadata']['pixel_size']
+#         microns_tf = Scale([ps, ps], axes=('x', 'y'))
+#         set_transformation(img, microns_tf, to_coordinate_system='microns')
+#     if len(microns_tf.scale) >= 2:
+#         x_y_axes = ('x', 'y')
+#         x_y_tf = [microns_tf.axes.index(axis) for axis in x_y_axes if axis in microns_tf.axes]
+#         microns_tf = Scale([microns_tf.scale[i] for i in x_y_tf], x_y_axes)
+#     return microns_tf
 
 def get_zstack_zarr(alignment_folder, paths, zstack_fov_size=None):
     zstack_folder = alignment_folder / 'zstacks'
@@ -100,130 +127,6 @@ def format_czstack(sdata,
         )
         sdata[f"{lab.split('_')[0]}_table"] = lab_table
 
-    return sdata
-
-def get_element_bytes(el):
-    try:
-        if hasattr(el, 'data') and hasattr(el.data, 'nbytes'):
-            return el.data.nbytes
-        elif hasattr(el, 'nbytes') and not callable(el.nbytes):
-            return el.nbytes
-        elif hasattr(el, 'compute'):  # Dask DataFrame (points)
-            return el.compute().memory_usage(deep=True).sum()
-        elif hasattr(el, '__sizeof__'):  # AnnData
-            return el.__sizeof__()
-    except Exception:
-        pass
-    return 0
-
-def print_sdata_size_summary(sdata):
-    # --- Size summary ---
-    print("\n=== Combined SpatialData size summary ===")
-    total_bytes = 0
-    for element_type, container in [('images', sdata.images),
-                                     ('labels', sdata.labels),
-                                     ('points', sdata.points),
-                                     ('tables', sdata.tables)]:
-        # Group by prefix (e.g. 'dapi_zstack', 'boundary', 'cell_labels')
-        groups = {}
-        for name, el in container.items():
-            el_bytes = get_element_bytes(el)
-            # Extract prefix: 'dapi_zstack-3' → 'dapi_zstack', 'gcamp' → 'gcamp'
-            prefix = name.rsplit('-', 1)[0] if '-' in name and name.rsplit('-', 1)[-1].isdigit() else name
-            if prefix not in groups:
-                groups[prefix] = {'bytes': 0, 'count': 0}
-            groups[prefix]['bytes'] += el_bytes
-            groups[prefix]['count'] += 1
-            total_bytes += el_bytes
-
-        print(f"\n  [{element_type}]")
-        for prefix, info in groups.items():
-            n = info['count']
-            gb = info['bytes'] / 1e9
-            label = f"({n} sections)" if n > 1 else ""
-            print(f"    {prefix} {label}: {gb:.2f} GB")
-
-    print(f"\n  Total (uncompressed, in-memory): {total_bytes / 1e9:.2f} GB")
-    print(f"  On-disk (zarr, ~3-5x compression): ~{total_bytes / 1e9 / 4:.2f}–{total_bytes / 1e9 / 3:.2f} GB estimated")
-    print("=========================================\n")
-
-####### Functions for manipulating spatialdata objects #########
-def get_spatial_elements(sdata):
-    spatial_elements = []
-    spatial_elements.extend(sdata.images.keys())
-    spatial_elements.extend(sdata.labels.keys())
-    spatial_elements.extend(sdata.points.keys())
-    spatial_elements.extend(sdata.shapes.keys())
-    return spatial_elements
-
-
-def rename_coordinate_systems_manual(sdata, rename_dict):
-    from geopandas import GeoDataFrame
-
-    def _rename_tfs(tfs):
-        return {rename_dict.get(k, k): v for k, v in tfs.items()}
-
-    def _is_multiscale_element(el):
-        keys_attr = getattr(el, "keys", None)
-        if not callable(keys_attr):
-            return False
-        try:
-            ks = list(el.keys())
-            if len(ks) == 0:
-                return False
-            # multiscale nodes usually have .image at each scale
-            first = el[ks[0]]
-            return hasattr(first, "image")
-        except Exception:
-            return False
-
-    for store in [sdata.images, sdata.labels, sdata.points, sdata.shapes]:
-        for el_name in list(store.keys()):
-            el = store[el_name]
-            try:
-                if _is_multiscale_element(el):
-                    for scale in el.keys():
-                        node = el[scale]
-                        img = node.image if hasattr(node, "image") else node
-                        img.attrs["transform"] = _rename_tfs(
-                            dict(img.attrs.get("transform", {}))
-                        )
-                else:
-                    # points/shapes/geodataframe/single-scale elements
-                    if hasattr(el, "attrs"):
-                        el.attrs["transform"] = _rename_tfs(
-                            dict(el.attrs.get("transform", {}))
-                        )
-            except Exception as e:
-                print(f"  Warning: could not rename transforms for {el_name}: {e}")
-
-    return sdata
-
-def rename_elements_section(sdata, section_n, rename_tables=True):
-    for el in list(sdata.images.keys()):
-        section_el = sdata[el]
-        del sdata[el]
-        sdata.images[f"{el}_{section_n}"] = section_el
-
-    for el in list(sdata.labels.keys()):
-        section_el = sdata[el]
-        del sdata[el]
-        sdata.labels[f"{el}_{section_n}"] = section_el
-
-    for el in list(sdata.points.keys()):
-        section_el = sdata[el]
-        del sdata[el]
-        sdata.points[f"{el}_{section_n}"] = section_el
-    
-    for el in list(sdata.shapes.keys()):
-        section_el = sdata[el]
-        del sdata[el]
-        sdata.shapes[f"{el}_{section_n}"] = section_el
-    if rename_tables:
-        for el in list(sdata.tables.keys()):
-            section_el = sdata[el]
-            del sdata[el]
-            sdata.tables[f"{el}_{section_n}"] = section_el
     return sdata
 
 def adjust_3d_images_z_scaling(sdata, sections_depth, elements_3d=['dapi_zstack'], center_z=True):
@@ -419,393 +322,264 @@ def make_element_3d(
     
     return sdata
 
-def get_single_scale(sdata, keep_scale=2, zstack_scale=0):
-    single_scale_sdata = sd.SpatialData()
-    for el_name in sdata.images.keys():
-        if el_name in ['zstack', 'gcamp', 'dextran']:
-            single_scale_sdata.images[el_name] = sd.get_pyramid_levels(sdata[el_name], n=zstack_scale)
-        else:
-            single_scale_sdata.images[el_name] = sd.get_pyramid_levels(sdata[el_name], n=keep_scale)
-    for el_name in sdata.labels.keys():
-        if el_name in ['zstack_label', 'gcamp_labels', 'dextran_labels']:
-            single_scale_sdata.labels[el_name] = sd.get_pyramid_levels(sdata[el_name], n=zstack_scale)
-        else:
-            single_scale_sdata.labels[el_name] = sd.get_pyramid_levels(sdata[el_name], n=keep_scale)
-    for el_name in sdata.points.keys():
-        single_scale_sdata.points[el_name] = sdata.points[el_name]
-    for el_name in sdata.tables.keys():
-        single_scale_sdata.tables[el_name] = sdata.tables[el_name]
-    for el_name in sdata.shapes.keys():
-        single_scale_sdata.shapes[el_name] = sdata.shapes[el_name]
-    return single_scale_sdata
 
-def drop_sdata_elements(sdata, drop_elements=['nucleus_labels', 'cell_boundaries', 'cell_circles', 'nucleus_boundaries']):
-    for el_name in drop_elements:
-        if el_name in sdata.labels:
-            del sdata.labels[el_name]
-        if el_name in sdata.images:
-            del sdata.images[el_name]
-        if el_name in sdata.shapes:
-            del sdata.shapes[el_name]
-        if el_name in sdata.points:
-            del sdata.points[el_name]
-    return sdata
 
-def separate_channels(sdata, element='morphology_focus', section_n=None, drop_source=True):
-    channel_name_map = {
-        'DAPI': 'dapi',
-        'ATP1A1/CD45/E-Cadherin': 'boundary',
-        '18S': 'rna',
-        'AlphaSMA/Vimentin': 'protein'
-    }
+# ####### Functions to handle landmarks #########
+# def get_biwarp_params(bigwarp_json_path):
+#     import json
+#     with open(bigwarp_json_path, 'r') as f:
+#         bw_json = json.load(f)
+#     for source, source_data in bw_json['Sources'].items():
+#         if source_data['isMoving']:
+#             if 'confocal' in source_data['uri'].lower():
+#                 continue
+#             moving_image_path = Path(source_data['uri'])
+#             if moving_image_path.name=='?':
+#                 moving_image_path = moving_image_path.parent
+#         else:
+#             reference_image_path = Path(source_data['uri'])
+#             if reference_image_path.name=='?':
+#                 reference_image_path = reference_image_path.parent
+#     if 'zstack' in moving_image_path.name.lower() or 'z_stack' in moving_image_path.name.lower():
+#         moving_image = 'czstack'
+#         reference_image = 'xenium_section'
+#     transform_type = bw_json['Transform']['type']
+#     bigwarp_params = {'moving_image': moving_image,
+#                     'reference_image': reference_image,
+#                     'moving_image_path': moving_image_path,
+#                     'reference_image_path': reference_image_path,
+#                     'transform_type': transform_type}
+#     return bigwarp_params
 
-    el = sdata.images[element]
+# def invert_xenium_y_landmarks(landmarks, landmarked_image_path):
+#     with tifffile.TiffFile(landmarked_image_path) as tif:
+#         landmarked_image_shape = tif.pages[0].shape
+#     full_y_size = landmarked_image_shape[0]
+#     landmarks['xenium_y'] = full_y_size - landmarks['xenium_y']
+#     return landmarks
 
-    # Get channel names from scale0
-    if hasattr(el, 'keys'):
-        scale_levels = list(el.keys())
-    else:
-        scale_levels = None
+# def remove_landmark_buffer(landmarks, czstack_buffer=None, xenium_buffer=None):
+#     if czstack_buffer is not None:
+#         landmarks['czstack_y'] = landmarks['czstack_y'] - czstack_buffer.get('y', 0)
+#         landmarks['czstack_x'] = landmarks['czstack_x'] - czstack_buffer.get('x', 0)
+#         landmarks['czstack_z'] = landmarks['czstack_z'] - czstack_buffer.get('z', 0)
+#     if xenium_buffer is not None:
+#         landmarks['xenium_y'] = landmarks['xenium_y'] - xenium_buffer.get('y', 0)
+#         landmarks['xenium_x'] = landmarks['xenium_x'] - xenium_buffer.get('x', 0)
+#         landmarks['xenium_z'] = landmarks['xenium_z'] - xenium_buffer.get('z', 0)
+#     return landmarks
 
-    if scale_levels:
-        c_coords = el[scale_levels[0]].image.coords['c'].values
-    else:
-        c_coords = el.coords['c'].values
+# def get_section_landmarks(landmarks_path, dims_order=['x','y','z'], bigwarp_project_path=None, moving_img=None):
+#     if bigwarp_project_path is not None:
+#         bigwarp_params = get_biwarp_params(bigwarp_project_path)
+#     elif moving_img is not None:
+#         bigwarp_params = {'moving_image': moving_img}
+#     else:
+#         print("No BigWarp project path or moving image specified - assuming czstack was moving image")
+#         bigwarp_params = {'moving_image': 'czstack'}
+#     print(f"Loading landmarks from: {landmarks_path}")
+#     landmarks = pd.read_csv(landmarks_path, header=None)
+#     if bigwarp_params['moving_image']=='czstack':
+#         # Flatten the lists using + operator to concatenate them
+#         landmarks.columns = ['landmark_name', 'active'] + [f'czstack_{dim}' for dim in dims_order] + [f'xenium_{dim}' for dim in dims_order]
+#     else:
+#         landmarks.columns = ['landmark_name', 'active'] + [f'xenium_{dim}' for dim in dims_order] + [f'czstack_{dim}' for dim in dims_order]
 
-    for ch in c_coords:
-        ch_name = channel_name_map.get(str(ch), str(ch))
+#     return landmarks, bigwarp_params
 
-        if scale_levels:
-            scale_dict = {}
+# def get_landmarked_image_props(landmarked_image_path, sdata, landmarks, 
+#                                 section_n, invert_y=False):
+#     with tifffile.TiffFile(landmarked_image_path) as tif:
+#         landmarked_image_shape = tif.pages[0].shape
+#     print(f"Landmarked image shape: {landmarked_image_shape}")
 
-            for scale_level in scale_levels:
-                img = el[str(scale_level)].image          # (c, z, y, x) or (c, y, x)
-                el_tf = get_transformation(img, get_all=True)
+#     bbox_xmin = 0
+#     bbox_ymin = 0
 
-                chan_img = img.sel(c=ch)                  # (z, y, x) or (y, x)
-                chan_img = chan_img.expand_dims('c', axis=0)
-                chan_img = chan_img.assign_coords(c=[ch_name])
+#     cell_labels = sd.get_pyramid_levels(sdata['cell_labels'], n=0)
+#     section_shape_y, section_shape_x = cell_labels.data.shape
 
-                # Determine dims based on actual shape
-                if chan_img.ndim == 4:
-                    parse_dims = ('c', 'z', 'y', 'x')
-                else:
-                    parse_dims = ('c', 'y', 'x')
-                    use_model = Image3DModel if 'z' in img.dims else Image3DModel
+#     bbox_dict = sdata['table'].uns.get('sections_bboxes', None)
 
-                parsed = Image3DModel.parse(
-                    chan_img.values,
-                    dims=parse_dims,
-                    c_coords=[ch_name],
-                    scale_factors=None,
-                    transformations=el_tf
-                ) if chan_img.ndim == 4 else __import__(
-                    'spatialdata.models', fromlist=['Image2DModel']
-                ).Image2DModel.parse(
-                    chan_img.values,
-                    dims=parse_dims,
-                    c_coords=[ch_name],
-                    scale_factors=None,
-                    transformations=el_tf
-                )
-                scale_dict[str(scale_level)] = parsed
-
-            new_dt = xr.DataTree.from_dict({
-                scale: xr.Dataset({'image': arr})
-                for scale, arr in scale_dict.items()
-            })
-        else:
-            el_tf = get_transformation(el, get_all=True)
-            chan_img = el.sel(c=ch)
-            if 'c' not in chan_img.dims:
-                chan_img = chan_img.expand_dims('c', axis=0)
-            chan_img = chan_img.assign_coords(c=[ch_name])
-
-            # Determine if this is 3D (c, z, y, x) or 2D (c, y, x)
-            if chan_img.ndim == 4:
-                parse_dims = ('c', 'z', 'y', 'x')
-                new_dt = Image3DModel.parse(
-                    chan_img.values,
-                    dims=parse_dims,
-                    c_coords=[ch_name],
-                    transformations=el_tf
-                )
-            else:
-                from spatialdata.models import Image2DModel
-                parse_dims = ('c', 'y', 'x')
-                new_dt = Image2DModel.parse(
-                    chan_img.values,
-                    dims=parse_dims,
-                    c_coords=[ch_name],
-                    transformations=el_tf
-                )
-
-        if ch_name in sdata.images:
-            del sdata.images[ch_name]
-        if section_n is not None:
-            ch_name = f"{ch_name}_{section_n}"
-        sdata.images[ch_name] = new_dt
-
-    if drop_source and element in sdata.images:
-        del sdata.images[element]
-    return sdata
-
-####### Functions to handle landmarks #########
-def get_biwarp_params(bigwarp_json_path):
-    import json
-    with open(bigwarp_json_path, 'r') as f:
-        bw_json = json.load(f)
-    for source, source_data in bw_json['Sources'].items():
-        if source_data['isMoving']:
-            if 'confocal' in source_data['uri'].lower():
-                continue
-            moving_image_path = Path(source_data['uri'])
-            if moving_image_path.name=='?':
-                moving_image_path = moving_image_path.parent
-        else:
-            reference_image_path = Path(source_data['uri'])
-            if reference_image_path.name=='?':
-                reference_image_path = reference_image_path.parent
-    if 'zstack' in moving_image_path.name.lower() or 'z_stack' in moving_image_path.name.lower():
-        moving_image = 'czstack'
-        reference_image = 'xenium_section'
-    transform_type = bw_json['Transform']['type']
-    bigwarp_params = {'moving_image': moving_image,
-                    'reference_image': reference_image,
-                    'moving_image_path': moving_image_path,
-                    'reference_image_path': reference_image_path,
-                    'transform_type': transform_type}
-    return bigwarp_params
-
-def invert_xenium_y_landmarks(landmarks, landmarked_image_path):
-    with tifffile.TiffFile(landmarked_image_path) as tif:
-        landmarked_image_shape = tif.pages[0].shape
-    full_y_size = landmarked_image_shape[0]
-    landmarks['xenium_y'] = full_y_size - landmarks['xenium_y']
-    return landmarks
-
-def remove_landmark_buffer(landmarks, czstack_buffer=None, xenium_buffer=None):
-    if czstack_buffer is not None:
-        landmarks['czstack_y'] = landmarks['czstack_y'] - czstack_buffer.get('y', 0)
-        landmarks['czstack_x'] = landmarks['czstack_x'] - czstack_buffer.get('x', 0)
-        landmarks['czstack_z'] = landmarks['czstack_z'] - czstack_buffer.get('z', 0)
-    if xenium_buffer is not None:
-        landmarks['xenium_y'] = landmarks['xenium_y'] - xenium_buffer.get('y', 0)
-        landmarks['xenium_x'] = landmarks['xenium_x'] - xenium_buffer.get('x', 0)
-        landmarks['xenium_z'] = landmarks['xenium_z'] - xenium_buffer.get('z', 0)
-    return landmarks
-
-def get_section_landmarks(landmarks_path, dims_order=['x','y','z'], bigwarp_project_path=None, moving_img=None):
-    if bigwarp_project_path is not None:
-        bigwarp_params = get_biwarp_params(bigwarp_project_path)
-    elif moving_img is not None:
-        bigwarp_params = {'moving_image': moving_img}
-    else:
-        print("No BigWarp project path or moving image specified - assuming czstack was moving image")
-        bigwarp_params = {'moving_image': 'czstack'}
-    print(f"Loading landmarks from: {landmarks_path}")
-    landmarks = pd.read_csv(landmarks_path, header=None)
-    if bigwarp_params['moving_image']=='czstack':
-        # Flatten the lists using + operator to concatenate them
-        landmarks.columns = ['landmark_name', 'active'] + [f'czstack_{dim}' for dim in dims_order] + [f'xenium_{dim}' for dim in dims_order]
-    else:
-        landmarks.columns = ['landmark_name', 'active'] + [f'xenium_{dim}' for dim in dims_order] + [f'czstack_{dim}' for dim in dims_order]
-
-    return landmarks, bigwarp_params
-
-def get_landmarked_image_props(landmarked_image_path, sdata, landmarks, 
-                                section_n, invert_y=False):
-    with tifffile.TiffFile(landmarked_image_path) as tif:
-        landmarked_image_shape = tif.pages[0].shape
-    print(f"Landmarked image shape: {landmarked_image_shape}")
-
-    bbox_xmin = 0
-    bbox_ymin = 0
-
-    cell_labels = sd.get_pyramid_levels(sdata['cell_labels'], n=0)
-    section_shape_y, section_shape_x = cell_labels.data.shape
-
-    bbox_dict = sdata['table'].uns.get('sections_bboxes', None)
-
-    if bbox_dict is not None and str(section_n) in bbox_dict:
-        # Paired: invert within image space FIRST, then scale to full slide + offset
-        if invert_y:
-            landmarks['xenium_y'] = landmarked_image_shape[0] - landmarks['xenium_y']
+#     if bbox_dict is not None and str(section_n) in bbox_dict:
+#         # Paired: invert within image space FIRST, then scale to full slide + offset
+#         if invert_y:
+#             landmarks['xenium_y'] = landmarked_image_shape[0] - landmarks['xenium_y']
         
-        section_bbox = bbox_dict[str(section_n)]
-        bbox_xmin = section_bbox['x_min']
-        bbox_ymin = section_bbox['y_min']
-        full_slide_shape_y = np.max([bbox['y_max'] for bbox in bbox_dict.values()])
-        full_slide_shape_x = np.max([bbox['x_max'] for bbox in bbox_dict.values()])
-        scale_factor_y = full_slide_shape_y / landmarked_image_shape[0]
-        scale_factor_x = full_slide_shape_x / landmarked_image_shape[1]
-        print(f"Paired section — full slide shape: {[full_slide_shape_y, full_slide_shape_x]}")
-        print(f"Image downsampled by: (yx) [{scale_factor_y:.4f}, {scale_factor_x:.4f}]")
-        print(f"Section bbox offset: {section_bbox}")
-    else:
-        # Standalone: scale to full section first, then invert within section space
-        scale_factor_y = section_shape_y / landmarked_image_shape[0]
-        scale_factor_x = section_shape_x / landmarked_image_shape[1]
-        print(f"Standalone section — section array shape: {[section_shape_y, section_shape_x]}")
-        print(f"Image downsampled by: (yx) [{scale_factor_y:.4f}, {scale_factor_x:.4f}]")
+#         section_bbox = bbox_dict[str(section_n)]
+#         bbox_xmin = section_bbox['x_min']
+#         bbox_ymin = section_bbox['y_min']
+#         full_slide_shape_y = np.max([bbox['y_max'] for bbox in bbox_dict.values()])
+#         full_slide_shape_x = np.max([bbox['x_max'] for bbox in bbox_dict.values()])
+#         scale_factor_y = full_slide_shape_y / landmarked_image_shape[0]
+#         scale_factor_x = full_slide_shape_x / landmarked_image_shape[1]
+#         print(f"Paired section — full slide shape: {[full_slide_shape_y, full_slide_shape_x]}")
+#         print(f"Image downsampled by: (yx) [{scale_factor_y:.4f}, {scale_factor_x:.4f}]")
+#         print(f"Section bbox offset: {section_bbox}")
+#     else:
+#         # Standalone: scale to full section first, then invert within section space
+#         scale_factor_y = section_shape_y / landmarked_image_shape[0]
+#         scale_factor_x = section_shape_x / landmarked_image_shape[1]
+#         print(f"Standalone section — section array shape: {[section_shape_y, section_shape_x]}")
+#         print(f"Image downsampled by: (yx) [{scale_factor_y:.4f}, {scale_factor_x:.4f}]")
 
-    landmarks['xenium_x'] = landmarks['xenium_x'] * scale_factor_x
-    landmarks['xenium_y'] = landmarks['xenium_y'] * scale_factor_y
-    landmarks['xenium_x'] = landmarks['xenium_x'] - bbox_xmin
-    landmarks['xenium_y'] = landmarks['xenium_y'] - bbox_ymin
+#     landmarks['xenium_x'] = landmarks['xenium_x'] * scale_factor_x
+#     landmarks['xenium_y'] = landmarks['xenium_y'] * scale_factor_y
+#     landmarks['xenium_x'] = landmarks['xenium_x'] - bbox_xmin
+#     landmarks['xenium_y'] = landmarks['xenium_y'] - bbox_ymin
 
-    if bbox_dict is None or str(section_n) not in bbox_dict:
-        # Standalone: invert after scaling, using full section height
-        if invert_y:
-            landmarks['xenium_y'] = section_shape_y - landmarks['xenium_y']
+#     if bbox_dict is None or str(section_n) not in bbox_dict:
+#         # Standalone: invert after scaling, using full section height
+#         if invert_y:
+#             landmarks['xenium_y'] = section_shape_y - landmarks['xenium_y']
 
-    return landmarks
+#     return landmarks
 
-def format_landmarks(sdata, 
-                    landmarks_path, 
-                    section_n, 
-                    bigwarp_project_paths=None,
-                    moving_img=None,
-                    czstack_buffer=None,
-                    invert_lm_y=False, 
-                    fix_cropped_landmarks=False,
-                    landmarked_image_path=None,
-                    dims_order=['x','y','z']):
+# def format_landmarks(sdata, 
+#                     landmarks_path, 
+#                     section_n, 
+#                     bigwarp_project_paths=None,
+#                     moving_img=None,
+#                     czstack_buffer=None,
+#                     invert_lm_y=False, 
+#                     fix_cropped_landmarks=False,
+#                     landmarked_image_path=None,
+#                     dims_order=['x','y','z']):
 
-    landmarks, bigwarp_params = get_section_landmarks(
-                                    landmarks_path=landmarks_path, 
-                                    bigwarp_project_path=bigwarp_project_paths,
-                                    moving_img=moving_img,
-                                    dims_order=dims_order)
+#     landmarks, bigwarp_params = get_section_landmarks(
+#                                     landmarks_path=landmarks_path, 
+#                                     bigwarp_project_path=bigwarp_project_paths,
+#                                     moving_img=moving_img,
+#                                     dims_order=dims_order)
 
-    if czstack_buffer is not None:
-        landmarks = remove_landmark_buffer(landmarks, 
-                                            czstack_buffer=czstack_buffer)
+#     if czstack_buffer is not None:
+#         landmarks = remove_landmark_buffer(landmarks, 
+#                                             czstack_buffer=czstack_buffer)
 
-    if fix_cropped_landmarks and landmarked_image_path is not None:
-        # invert_y is handled inside get_landmarked_image_props at the right point
-        landmarks = get_landmarked_image_props(
-                            landmarked_image_path, 
-                            sdata, 
-                            landmarks, 
-                            section_n,
-                            invert_y=invert_lm_y)
-    elif invert_lm_y and landmarked_image_path is not None:
-        # sections where fix_cropped_landmarks=False
-        landmarks = invert_xenium_y_landmarks(landmarks, landmarked_image_path)
+#     if fix_cropped_landmarks and landmarked_image_path is not None:
+#         # invert_y is handled inside get_landmarked_image_props at the right point
+#         landmarks = get_landmarked_image_props(
+#                             landmarked_image_path, 
+#                             sdata, 
+#                             landmarks, 
+#                             section_n,
+#                             invert_y=invert_lm_y)
+#     elif invert_lm_y and landmarked_image_path is not None:
+#         # sections where fix_cropped_landmarks=False
+#         landmarks = invert_xenium_y_landmarks(landmarks, landmarked_image_path)
 
-    # Adjust landmarks resolutions
-    full_scale_pixel_size = sdata['table'].uns['section_metadata']['pixel_size']
-    landmarks = landmarks.rename(columns={'xenium_x': 'x', 'xenium_y': 'y', 'xenium_z': 'z'})
-    landmarks = PointsModel.parse(landmarks)
-    set_transformation(landmarks, Identity(), to_coordinate_system='global')
-    set_transformation(
-        landmarks,
-        Scale([full_scale_pixel_size, full_scale_pixel_size], axes=('x', 'y')),
-        to_coordinate_system='microns'
-    )
-    return landmarks
+#     # Adjust landmarks resolutions
+#     full_scale_pixel_size = sdata['table'].uns['section_metadata']['pixel_size']
+#     landmarks = landmarks.rename(columns={'xenium_x': 'x', 'xenium_y': 'y', 'xenium_z': 'z'})
+#     landmarks = PointsModel.parse(landmarks)
+#     set_transformation(landmarks, Identity(), to_coordinate_system='global')
+#     set_transformation(
+#         landmarks,
+#         Scale([full_scale_pixel_size, full_scale_pixel_size], axes=('x', 'y')),
+#         to_coordinate_system='microns'
+#     )
+#     return landmarks
 
-####### Functions to find transforms ##########
-def get_affine_from_landmarks_flat(moving_coords, ref_coords):
-    moving_2d = moving_coords[:, :2]
-    ref_2d = ref_coords[:, :2]
-    n = moving_2d.shape[0]
-    A_xy = np.hstack([moving_2d, np.ones((n, 1))])
-    result, _, _, _ = np.linalg.lstsq(A_xy, ref_2d, rcond=None)
+# ####### Functions to find transforms ##########
+# def get_affine_from_landmarks_flat(moving_coords, ref_coords):
+#     moving_2d = moving_coords[:, :2]
+#     ref_2d = ref_coords[:, :2]
+#     n = moving_2d.shape[0]
+#     A_xy = np.hstack([moving_2d, np.ones((n, 1))])
+#     result, _, _, _ = np.linalg.lstsq(A_xy, ref_2d, rcond=None)
 
-    # Z offset: mean difference between ref and moving Z coords
-    # mat[2,2] = 1.0 keeps matrix invertible (required by Napari)
-    z_offset = float(np.mean(ref_coords[:, 2] - moving_coords[:, 2]))
+#     # Z offset: mean difference between ref and moving Z coords
+#     # mat[2,2] = 1.0 keeps matrix invertible (required by Napari)
+#     z_offset = float(np.mean(ref_coords[:, 2] - moving_coords[:, 2]))
 
-    mat = np.eye(4)
-    mat[0, 0] = result[0, 0]; mat[0, 1] = result[1, 0]; mat[0, 3] = result[2, 0]
-    mat[1, 0] = result[0, 1]; mat[1, 1] = result[1, 1]; mat[1, 3] = result[2, 1]
-    mat[2, 2] = 1.0   # MUST be 1.0 - keeps matrix invertible for Napari rendering
-    mat[2, 3] = z_offset
+#     mat = np.eye(4)
+#     mat[0, 0] = result[0, 0]; mat[0, 1] = result[1, 0]; mat[0, 3] = result[2, 0]
+#     mat[1, 0] = result[0, 1]; mat[1, 1] = result[1, 1]; mat[1, 3] = result[2, 1]
+#     mat[2, 2] = 1.0   # MUST be 1.0 - keeps matrix invertible for Napari rendering
+#     mat[2, 3] = z_offset
 
-    return Affine(mat, input_axes=('x', 'y', 'z'), output_axes=('x', 'y', 'z'))
+#     return Affine(mat, input_axes=('x', 'y', 'z'), output_axes=('x', 'y', 'z'))
 
-def tilt_affines(moving_pts, fixed_pts, flat_affine):
-    # moving_pts = Xenium (2D: x, y, 0)
-    # fixed_pts = CZStack (3D: x, y, z)
+# def tilt_affines(moving_pts, fixed_pts, flat_affine):
+#     # moving_pts = Xenium (2D: x, y, 0)
+#     # fixed_pts = CZStack (3D: x, y, z)
     
-    # Fit Z_stack = a*X_xe + b*Y_xe + c
-    A = np.column_stack([moving_pts[:, 0], moving_pts[:, 1], np.ones(len(moving_pts))])
-    coeffs, _, _, _ = lstsq(A, fixed_pts[:, 2])
-    a, b, c = coeffs
+#     # Fit Z_stack = a*X_xe + b*Y_xe + c
+#     A = np.column_stack([moving_pts[:, 0], moving_pts[:, 1], np.ones(len(moving_pts))])
+#     coeffs, _, _, _ = lstsq(A, fixed_pts[:, 2])
+#     a, b, c = coeffs
     
-    # Build the 3D matrix using the 2D XY results
-    tilt_mat = np.array(flat_affine.matrix).copy()
-    tilt_mat[2, 0] = a   # Effect of Xenium X on Stack Z
-    tilt_mat[2, 1] = b   # Effect of Xenium Y on Stack Z
-    tilt_mat[2, 2] = 1.0 # Keeps matrix invertible
-    tilt_mat[2, 3] = c   # The base Z-slice offset
+#     # Build the 3D matrix using the 2D XY results
+#     tilt_mat = np.array(flat_affine.matrix).copy()
+#     tilt_mat[2, 0] = a   # Effect of Xenium X on Stack Z
+#     tilt_mat[2, 1] = b   # Effect of Xenium Y on Stack Z
+#     tilt_mat[2, 2] = 1.0 # Keeps matrix invertible
+#     tilt_mat[2, 3] = c   # The base Z-slice offset
     
-    return Affine(tilt_mat, input_axes=('x', 'y', 'z'), output_axes=('x', 'y', 'z'))
+#     return Affine(tilt_mat, input_axes=('x', 'y', 'z'), output_axes=('x', 'y', 'z'))
 
-def _is_multiscale(element):
-    return (
-        hasattr(element, 'keys')
-        and callable(element.keys)
-        and not isinstance(element, GeoDataFrame)
-    )
+# def _is_multiscale(element):
+#     return (
+#         hasattr(element, 'keys')
+#         and callable(element.keys)
+#         and not isinstance(element, GeoDataFrame)
+#     )
 
-def get_microns_scales(sdata, element_name):
-    el = sdata[element_name]
-    if _is_multiscale(el):
-        img = sd.get_pyramid_levels(el, n=0)
-        img = img.image if hasattr(img, 'image') else img
-    else:
-        img = el.image if hasattr(el, 'image') else el
+# def get_microns_scales(sdata, element_name):
+#     el = sdata[element_name]
+#     if _is_multiscale(el):
+#         img = sd.get_pyramid_levels(el, n=0)
+#         img = img.image if hasattr(img, 'image') else img
+#     else:
+#         img = el.image if hasattr(el, 'image') else el
 
-    # Get transforms from the actual image DataArray, not the DataTree
-    el_transforms = get_transformation(img, get_all=True)
-    microns_tf = el_transforms.get('microns', None)
-    if microns_tf is None:
-        ps = sdata['table'].uns['section_metadata']['pixel_size']
-        microns_tf = Scale([ps, ps], axes=('x', 'y'))
-        set_transformation(img, microns_tf, to_coordinate_system='microns')
-    if len(microns_tf.scale) >= 2:
-        x_y_axes = ('x', 'y')
-        x_y_tf = [microns_tf.axes.index(axis) for axis in x_y_axes if axis in microns_tf.axes]
-        microns_tf = Scale([microns_tf.scale[i] for i in x_y_tf], x_y_axes)
-    return microns_tf
+#     # Get transforms from the actual image DataArray, not the DataTree
+#     el_transforms = get_transformation(img, get_all=True)
+#     microns_tf = el_transforms.get('microns', None)
+#     if microns_tf is None:
+#         ps = sdata['table'].uns['section_metadata']['pixel_size']
+#         microns_tf = Scale([ps, ps], axes=('x', 'y'))
+#         set_transformation(img, microns_tf, to_coordinate_system='microns')
+#     if len(microns_tf.scale) >= 2:
+#         x_y_axes = ('x', 'y')
+#         x_y_tf = [microns_tf.axes.index(axis) for axis in x_y_axes if axis in microns_tf.axes]
+#         microns_tf = Scale([microns_tf.scale[i] for i in x_y_tf], x_y_axes)
+#     return microns_tf
 
-def add_affine_to_element(element, affine_tf, coord_sys_name, 
-                          microns_tf=None, microns_tf_position='before',
-                          overwrite_existing=False):
-    """
-    microns_tf_position: 'before' puts microns_tf before affine_tf (section px → µm → czstack px)
-                         'after'  puts microns_tf after  affine_tf (section px → czstack px → czstack µm)
-    """
-    def _build_tf(tf_to_fullres):
-        if microns_tf is not None:
-            if microns_tf_position == 'after':
-                return Sequence([tf_to_fullres, affine_tf, microns_tf])
-            else:
-                return Sequence([tf_to_fullres, microns_tf, affine_tf])
-        return Sequence([tf_to_fullres, affine_tf])
+# def add_affine_to_element(element, affine_tf, coord_sys_name, 
+#                           microns_tf=None, microns_tf_position='before',
+#                           overwrite_existing=False):
+#     """
+#     microns_tf_position: 'before' puts microns_tf before affine_tf (section px → µm → czstack px)
+#                          'after'  puts microns_tf after  affine_tf (section px → czstack px → czstack µm)
+#     """
+#     def _build_tf(tf_to_fullres):
+#         if microns_tf is not None:
+#             if microns_tf_position == 'after':
+#                 return Sequence([tf_to_fullres, affine_tf, microns_tf])
+#             else:
+#                 return Sequence([tf_to_fullres, microns_tf, affine_tf])
+#         return Sequence([tf_to_fullres, affine_tf])
 
-    if _is_multiscale(element):
-        for n_l, level in enumerate(element.keys()):
-            element_obj = sd.get_pyramid_levels(element, n=n_l)
-            tf_to_fullres = get_transformation(element_obj, to_coordinate_system='global')
-            if isinstance(tf_to_fullres, Identity):
-                tf_to_fullres = Scale([1.0, 1.0, 1.0], axes=('x', 'y', 'z'))
-            if coord_sys_name in element_obj.attrs['transform'] and not overwrite_existing:
-                continue
-            set_transformation(element_obj, _build_tf(tf_to_fullres), 
-                               to_coordinate_system=coord_sys_name)
-    else:
-        element_obj = element
-        tf_to_fullres = get_transformation(element_obj, to_coordinate_system='global')
-        if isinstance(tf_to_fullres, Identity):
-            tf_to_fullres = Scale([1.0, 1.0, 1.0], axes=('x', 'y', 'z'))
-        if coord_sys_name in element_obj.attrs['transform'] and not overwrite_existing:
-            return
-        set_transformation(element_obj, _build_tf(tf_to_fullres),
-                           to_coordinate_system=coord_sys_name)
+#     if _is_multiscale(element):
+#         for n_l, level in enumerate(element.keys()):
+#             element_obj = sd.get_pyramid_levels(element, n=n_l)
+#             tf_to_fullres = get_transformation(element_obj, to_coordinate_system='global')
+#             if isinstance(tf_to_fullres, Identity):
+#                 tf_to_fullres = Scale([1.0, 1.0, 1.0], axes=('x', 'y', 'z'))
+#             if coord_sys_name in element_obj.attrs['transform'] and not overwrite_existing:
+#                 continue
+#             set_transformation(element_obj, _build_tf(tf_to_fullres), 
+#                                to_coordinate_system=coord_sys_name)
+#     else:
+#         element_obj = element
+#         tf_to_fullres = get_transformation(element_obj, to_coordinate_system='global')
+#         if isinstance(tf_to_fullres, Identity):
+#             tf_to_fullres = Scale([1.0, 1.0, 1.0], axes=('x', 'y', 'z'))
+#         if coord_sys_name in element_obj.attrs['transform'] and not overwrite_existing:
+#             return
+#         set_transformation(element_obj, _build_tf(tf_to_fullres),
+#                            to_coordinate_system=coord_sys_name)
 
 ####### QC alignment #########
 def get_section_z_stats(affines_dict, landmarks_dict, czstack_shape_yx=(512, 512)):
@@ -1276,8 +1050,6 @@ def align_section_to_zstack(sdata,
 
     return sdata
 
-
-
 def write_sdata_elements(sdata, sdata_path, overwrite=False, num_workers=4):
     """
     Write a SpatialData object element-by-element with a progress bar.
@@ -1385,7 +1157,6 @@ def _unwrap_da(element):
         else:
             break
     return da
-
 
 def _as_pandas(df_like):
     if hasattr(df_like, 'compute'):
