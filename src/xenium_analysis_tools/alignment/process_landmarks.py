@@ -69,15 +69,19 @@ _DIHEDRAL_TRANSFORMS = [
         lambda img: np.fliplr(np.rot90(img, k=1)),
         lambda x, y, H, W: (W - 1 - y, H - 1 - x)),
 ]
+# O(1) name → (img_fn, lm_fn) lookup — avoids a second linear scan over the list.
+_DIHEDRAL_BY_NAME = {name: (img_fn, lm_fn) for name, img_fn, lm_fn in _DIHEDRAL_TRANSFORMS}
 
 def invert_xenium_y_landmarks(landmarks, landmarked_image_path):
     with tifffile.TiffFile(landmarked_image_path) as tif:
-        landmarked_image_shape = tif.pages[0].shape
-    full_y_size = landmarked_image_shape[0]
+        arr = tif.asarray()
+    full_y_size = int(arr.shape[-2])   # robust to (C,H,W) and (H,W) layouts
+    landmarks = landmarks.copy()
     landmarks['xenium_y'] = full_y_size - landmarks['xenium_y']
     return landmarks
 
 def remove_landmark_buffer(landmarks, czstack_buffer=None, xenium_buffer=None):
+    landmarks = landmarks.copy()
     if czstack_buffer is not None:
         landmarks['czstack_y'] = landmarks['czstack_y'] - czstack_buffer.get('y', 0)
         landmarks['czstack_x'] = landmarks['czstack_x'] - czstack_buffer.get('x', 0)
@@ -108,7 +112,7 @@ def _is_czstack(uri_or_name):
     s = uri_or_name.lower()
     return any(kw in s for kw in ('zstack', 'z_stack', 'gcamp'))
 
-def extract_bigwarp_params(bigwarp_json_path, axes_order=['x', 'y', 'z']):
+def extract_bigwarp_params(bigwarp_json_path, axes_order=None):
     """Parse a BigWarp project JSON and return source metadata and landmark DataFrame.
 
     Supports two project formats:
@@ -134,6 +138,8 @@ def extract_bigwarp_params(bigwarp_json_path, axes_order=['x', 'y', 'z']):
         Columns follow the pattern czstack_{ax} / xenium_{ax} for each ax
         in axes_order.
     """
+    if axes_order is None:
+        axes_order = ['x', 'y', 'z']
     with open(bigwarp_json_path, 'r') as f:
         bw_json = json.load(f)
 
@@ -185,7 +191,12 @@ def extract_bigwarp_params(bigwarp_json_path, axes_order=['x', 'y', 'z']):
                 **{f'czstack_{ax}': [pt[i] for pt in czstack_pts] for i, ax in enumerate(axes_order)},
                 **{f'xenium_{ax}':  [pt[i] for pt in xenium_pts]  for i, ax in enumerate(axes_order)},
             })
-            lm_df = lm_df.loc[lm_df['active']==True]
+            lm_df = lm_df.loc[lm_df['active']].copy()
+            # Xenium sections are 2D; BigWarp can record sub-pixel z-offsets in its 3D
+            # coordinate system (e.g. -0.18 px) that are pure numerical noise.  Zero them
+            # out so they don't corrupt tilt_affines() z-plane estimation downstream.
+            if 'xenium_z' in lm_df.columns:
+                lm_df['xenium_z'] = 0.0
 
     bigwarps_params = {
         'moving_image_dataset':  moving_image_dataset,
@@ -207,7 +218,7 @@ def _thumbnail(img, max_size=128):
     return img[::sr, ::sc]
 
 def _ncc(a, b):
-    """Normalised cross-correlation in [-1, 1]; 1 = perfect match."""
+    """Normalized cross-correlation in [-1, 1]; 1 = perfect match."""
     a = a.astype(float); b = b.astype(float)
     a -= a.mean();        b -= b.mean()
     denom = np.sqrt((a**2).sum() * (b**2).sum())
@@ -279,7 +290,7 @@ def plot_manual_landmark_transforms(landmarks_before,
                                     section=None,
                                     save_path=None,
                                     show=True):
-    """Visualise the manual landmark coordinate transform.
+    """Visualize the manual landmark coordinate transform.
 
     Two-panel figure:
       Left  — landmarked TIFF with original (xenium_x, xenium_y) landmarks in
@@ -396,7 +407,7 @@ def find_landmarked_img_transforms(landmarked_image_path,
     1. Match the landmarked TIFF to the correct pyramid level of
        ``morphology_focus`` by comparing shapes (rotation-aware).
     2. Score all 8 dihedral (rotation + flip) transforms of the sdata image
-       against the landmarked image using normalised cross-correlation on
+       against the landmarked image using Normalized cross-correlation on
        downsampled thumbnails.
     3. Apply the inverse of the best transform to the landmark
        (xenium_x, xenium_y) columns, adding (sdata_x, sdata_y) columns.
@@ -469,11 +480,7 @@ def find_landmarked_img_transforms(landmarked_image_path,
 
     best_name  = max(scores, key=scores.get)
     best_score = scores[best_name]
-    best_img_fn, best_lm_fn = next(
-        (img_fn, lm_fn)
-        for name, img_fn, lm_fn in _DIHEDRAL_TRANSFORMS
-        if name == best_name
-    )
+    best_img_fn, best_lm_fn = _DIHEDRAL_BY_NAME[best_name]
 
     print(f"Matched pyramid level : {matched_level}  (sdata shape {H}×{W})")
     print(f"Best transform        : '{best_name}'  (NCC = {best_score:.4f})")
@@ -503,8 +510,6 @@ def find_landmarked_img_transforms(landmarked_image_path,
         'sdata_img_shape':   (H, W),
     }
 
-    # Always save the diagnostic image when a path is given; only show when
-    # plot_imgs=True (avoids blocking plt.show() inside worker threads).
     if plot_imgs or save_imgs_path is not None:
         section_n = sdata['table'].obs['section'].iloc[0] if 'section' in sdata['table'].obs else None
         plot_img_landmark_transforms(sdata_img=sdata_img, 
@@ -519,14 +524,65 @@ def find_landmarked_img_transforms(landmarked_image_path,
 
     return transform_info, landmarks_out
 
-def parse_landmarks(landmarks, transform_info):
-    landmarks.drop(columns=['sdata_x','sdata_y'], inplace=True)
+def parse_landmarks(landmarks, transform_info, x_col=None, y_col=None):
+    """Parse a landmarks DataFrame into a SpatialData PointsModel.
+
+    Parameters
+    ----------
+    landmarks : pd.DataFrame
+        Output of ``find_landmarked_img_transforms``.  Must contain
+        ``czstack_x/y/z`` and either ``xenium_x/y`` or ``sdata_x/y`` columns.
+    transform_info : dict
+        Returned by ``find_landmarked_img_transforms``.  Used for pixel_size
+        and matched_level_transforms.
+    x_col : str or None
+        Column to use as the section x-coordinate (default: ``'sdata_x'`` when
+        present, otherwise ``'xenium_x'``).  Use ``'sdata_x'`` when the
+        BigWarp TIFF is oriented differently from the SpatialData image (the
+        common case when ``landmarked_from_sdata=True`` and the matched dihedral
+        transform is not identity).  Use ``'xenium_x'`` only when the TIFF and
+        SpatialData images share the same axis orientation (identity transform).
+    y_col : str or None
+        Column to use as the section y-coordinate (default: ``'sdata_y'`` when
+        present, otherwise ``'xenium_y'``).
+    """
+    landmarks = landmarks.copy()
+
+    # ── 1. Determine which x/y columns to use ────────────────────────────
+    # Priority: explicit x_col/y_col > sdata_x/y (when present) > xenium_x/y
+    if x_col is None:
+        x_col = 'sdata_x' if 'sdata_x' in landmarks.columns else 'xenium_x'
+    if y_col is None:
+        y_col = 'sdata_y' if 'sdata_y' in landmarks.columns else 'xenium_y'
+
+    # Drop all section-space x/y aliases except the chosen ones, then rename
+    # directly to canonical 'x'/'y' names used by PointsModel.
+    drop_cols = [c for c in ('xenium_x', 'xenium_y', 'sdata_x', 'sdata_y')
+                 if c in landmarks.columns and c not in (x_col, y_col)]
+    landmarks = landmarks.drop(columns=drop_cols)
+    landmarks = landmarks.rename(columns={x_col: 'x', y_col: 'y', 'xenium_z': 'z'})
+
     full_scale_pixel_size = transform_info['pixel_size']
-    landmarks = landmarks.rename(columns={'xenium_x': 'x', 'xenium_y': 'y', 'xenium_z': 'z'})
-    landmarks = PointsModel.parse(landmarks)
-    landmarks.attrs['transform'] = {}
-    landmarks.attrs['transform']['global'] = transform_info['matched_level_transforms']
-    landmarks.attrs['transform']['microns'] = Sequence([transform_info['matched_level_transforms'], Scale([full_scale_pixel_size, full_scale_pixel_size], axes=('x', 'y'))])
+
+    landmarks  = PointsModel.parse(landmarks)
+    global_tf  = transform_info['matched_level_transforms']['global']
+    set_transformation(landmarks, global_tf, to_coordinate_system='global')
+
+    microns_scale = Scale([full_scale_pixel_size, full_scale_pixel_size], axes=('x', 'y'))
+    # Compose: matched-level pixels → full-res pixels (global_tf) → microns.
+    # When global_tf is Identity (level-0 / full-res), no upscaling is needed.
+    # When both transforms are Scale with the same axes they can be merged into
+    # one Scale (element-wise product), avoiding an unnecessary Sequence wrapper.
+    if isinstance(global_tf, Identity):
+        microns_tf = microns_scale
+    elif isinstance(global_tf, Scale) and global_tf.axes == microns_scale.axes:
+        microns_tf = Scale(
+            [g * m for g, m in zip(global_tf.scale, microns_scale.scale)],
+            axes=global_tf.axes,
+        )
+    else:
+        microns_tf = Sequence([global_tf, microns_scale])
+    set_transformation(landmarks, microns_tf, to_coordinate_system='microns')
     return landmarks
 
 def _process_section(s_n, paths, alignment_params):
@@ -564,12 +620,9 @@ def _process_section(s_n, paths, alignment_params):
             print(f"  Section {s_n}: landmarks not found at {landmarks_path}, skipping")
             return s_n, None
         print(f"  Manually transforming landmarks...")
-        landmarked_image_path = (paths['data_root']
-                                 / alignment_params['landmarked_images_folder']
-                                 / alignment_params['landmarked_images_names_fn'](s_n))
         val_folder = alignment_params.get('validation_images_folder')
         save_imgs_path = val_folder / f"section_{s_n}_manual.png" if val_folder is not None else None
-        formatted_landmarks = manual_landmarks_transform(
+        landmarks_out, transform_info = manual_landmarks_transform(
             s_n=s_n,
             sdata_path=sdata_path,
             landmarks_path=landmarks_path,
@@ -578,6 +631,7 @@ def _process_section(s_n, paths, alignment_params):
             bigwarp_params=bigwarp_params,
             save_imgs_path=save_imgs_path,
         )
+        formatted_landmarks = parse_landmarks(landmarks_out, transform_info)
 
     else:
         print(f"Formatting section {s_n} landmarks")
@@ -591,15 +645,61 @@ def _process_section(s_n, paths, alignment_params):
         if landmarks_out is None:
             return s_n, None
         else:
-            formatted_landmarks = parse_landmarks(landmarks_out, transform_info)
+            # Use sdata_x/y (landmarks remapped to SpatialData pixel space) when the
+            # BigWarp TIFF and SpatialData image may not share the same axis orientation.
+            # For manual landmarks (no sdata_ columns) the default falls back to xenium_x/y.
+            formatted_landmarks = parse_landmarks(landmarks_out, transform_info,
+                                                  x_col='sdata_x', y_col='sdata_y')
 
     return s_n, formatted_landmarks
 
 
 def manual_landmarks_transform(s_n, sdata_path, landmarks_path, landmarked_image_path,
                                alignment_params, bigwarp_params,
-                               dims_order=['x', 'y', 'z'],
+                               dims_order=None,
                                save_imgs_path=None):
+    """Transform manual BigWarp CSV landmarks into SpatialData pixel space.
+
+    Reads a raw BigWarp CSV landmark file, optionally applies coordinate
+    corrections (bbox offset via ``fix_cropped_landmarks``, y-axis inversion
+    via ``invert_lm_y``), and returns the corrected landmark DataFrame together
+    with a ``transform_info`` dict compatible with ``parse_landmarks``.
+
+    Parameters
+    ----------
+    s_n : int or str
+        Section number (used as the bbox key and for diagnostic messages).
+    sdata_path : str or Path
+        Section ``.zarr`` SpatialData path (loaded once internally).
+    landmarks_path : str or Path
+        BigWarp-format CSV: columns are
+        ``[name, active, czstack_x/y/z, xenium_x/y/z]`` or reversed.
+    landmarked_image_path : str or Path
+        TIFF used during BigWarp landmarking (needed by
+        ``get_landmarked_image_props`` for shape and coordinate corrections).
+    alignment_params : dict
+        Keys used: ``czstack_buffer``, ``fix_cropped_landmarks``,
+        ``invert_lm_y``, ``validation_images_folder``.
+    bigwarp_params : dict
+        Returned by ``extract_bigwarp_params``; the ``moving_image_dataset``
+        key determines CSV column assignment order.
+    dims_order : list of str or None
+        Axis labels matching the CSV coordinate positions
+        (default ``['x', 'y', 'z']``).
+    save_imgs_path : Path or str or None
+        If provided, a diagnostic plot is saved here.
+
+    Returns
+    -------
+    landmarks_out : pd.DataFrame
+        Corrected landmark coordinates in matched-level pixel space.
+    landmarks_tf_info : dict
+        ``matched_level_transforms`` (``{'global': Transform}``),
+        ``pixel_size``, ``scale_factor_x/y``, ``bbox``.
+        Compatible with ``parse_landmarks``.
+    """
+    if dims_order is None:
+        dims_order = ['x', 'y', 'z']
     # ── Read sdata once — needed for pixel size and get_landmarked_image_props ──
     sdata = sd.read_zarr(sdata_path)
     full_scale_pixel_size = sdata['table'].uns['section_metadata']['pixel_size']
@@ -621,12 +721,10 @@ def manual_landmarks_transform(s_n, sdata_path, landmarks_path, landmarked_image
         landmarks_out = remove_landmark_buffer(
             landmarks_out, czstack_buffer=alignment_params['czstack_buffer'])
 
-    if alignment_params.get('fix_cropped_landmarks', False) and landmarked_image_path is not None:
+    if alignment_params.get('fix_cropped_landmarks', False) or alignment_params.get('invert_lm_y', False):
         landmarks_out, landmarks_tf_info = get_landmarked_image_props(
             landmarked_image_path, sdata, landmarks_out, s_n,
             invert_y=alignment_params.get('invert_lm_y', False))
-    elif alignment_params.get('invert_lm_y', False) and landmarked_image_path is not None:
-        landmarks_out = invert_xenium_y_landmarks(landmarks_out, landmarked_image_path)
 
     if save_imgs_path is not None:
         plot_manual_landmark_transforms(
@@ -640,19 +738,16 @@ def manual_landmarks_transform(s_n, sdata_path, landmarks_path, landmarked_image
             show=False,
         )
 
-    landmarks_out = landmarks_out.rename(
-        columns={'xenium_x': 'x', 'xenium_y': 'y', 'xenium_z': 'z'})
-    parsed_lm = PointsModel.parse(landmarks_out)
-    set_transformation(parsed_lm, Identity(), to_coordinate_system='global')
-    set_transformation(
-        parsed_lm,
-        Scale([full_scale_pixel_size, full_scale_pixel_size], axes=('x', 'y')),
-        to_coordinate_system='microns',
-    )
-    return parsed_lm
+    # When no coordinate corrections were applied, landmarks are already in
+    # full-res pixel space (= global coordinate system).
+    if landmarks_tf_info is None:
+        landmarks_tf_info = {
+            'matched_level_transforms': {'global': Identity()},
+            'pixel_size': full_scale_pixel_size,
+        }
+    return landmarks_out, landmarks_tf_info
 
 def get_section_landmarks_threads(xenium_section_ns, paths, alignment_params, n_workers=None):
-    from concurrent.futures import ThreadPoolExecutor, as_completed
     if n_workers is None:
         n_workers = min(4, len(xenium_section_ns))
     print(f"Processing {len(xenium_section_ns)} sections with {n_workers} parallel workers …")
@@ -804,57 +899,147 @@ def compare_affines(derived_affine, calculated_affines, section_n,
     print("=" * 70)
     return results
 
-def get_landmarked_image_props(landmarked_image_path, sdata, landmarks, 
-                                section_n, invert_y=False):
+def get_landmarked_image_props(landmarked_image_path, sdata, landmarks,
+                               section_n, invert_y=False):
+    """Map landmark coordinates from the landmarked TIFF's pixel space into
+    the SpatialData section's full-resolution pixel space.
+
+    Two cases are handled:
+
+    **Paired** (multi-section slide, ``sections_bboxes`` present in table.uns):
+      The TIFF is a downsampled view of the entire slide.  Coordinates are
+      first optionally inverted (in TIFF pixel space), then scaled to the
+      full slide, then offset by the section's bounding-box origin.
+
+    **Standalone** (single-section TIFF, no bbox metadata):
+      The TIFF is matched to the ``morphology_focus`` pyramid level with the
+      same dimensions.  The scale factors are read from that level's stored
+      ``global`` transform rather than being computed as a ratio of shapes,
+      making them robust to non-integer or asymmetric downsampling.  As a
+      fallback (no matching level found), the ratio against ``cell_labels``
+      full-res shape is used.  Coordinates are scaled to full-resolution, then
+      optionally inverted.
+
+    Both cases produce the same result: inverting before vs after an isotropic
+    scale is equivalent (``(H - y) * k  ==  H*k - y*k``).  The ordering
+    differs only to keep the inversion in the natural "image" space for each
+    case.
+
+    Parameters
+    ----------
+    landmarked_image_path : str or Path
+    sdata : SpatialData or str or Path
+        Section SpatialData object (or path to its zarr).
+    landmarks : pd.DataFrame
+        Must contain ``xenium_x`` and ``xenium_y`` columns in TIFF pixel
+        space.  **A copy is returned; the input is not modified.**
+    section_n : int or str
+    invert_y : bool
+        Mirror the y-axis (needed when the TIFF was vertically flipped
+        relative to the SpatialData image).
+
+    Returns
+    -------
+    landmarks : pd.DataFrame
+        Copy of input with ``xenium_x``/``xenium_y`` remapped to SpatialData
+        full-resolution pixel space.
+    landmarks_tf_info : dict
+        ``scale_factor_x``, ``scale_factor_y``, ``bbox`` (section bbox dict
+        or None), ``fullres_pixel_size``.
+    """
+    # ── TIFF spatial dimensions ───────────────────────────────────────────
+    # Use asarray() so channel dimensions (C, H, W) or (H, W, C) are handled
+    # correctly; spatial H and W are always the last two axes.
     with tifffile.TiffFile(landmarked_image_path) as tif:
-        landmarked_image_shape = tif.pages[0].shape
-    print(f"Landmarked image shape: {landmarked_image_shape}")
-    if isinstance(sdata, str) or isinstance(sdata, Path):
+        arr = tif.asarray()
+    lm_H, lm_W = int(arr.shape[-2]), int(arr.shape[-1])
+    print(f"Landmarked image shape (H×W): {lm_H}×{lm_W}")
+
+    if isinstance(sdata, (str, Path)):
         sdata = sd.read_zarr(sdata)
-    bbox_xmin = 0
-    bbox_ymin = 0
 
-    cell_labels = sd.get_pyramid_levels(sdata['cell_labels'], n=0)
-    section_shape_y, section_shape_x = cell_labels.data.shape
+    bbox_dict   = sdata['table'].uns.get('sections_bboxes', None)
+    section_key = str(section_n)
+    is_paired   = bbox_dict is not None and section_key in bbox_dict
 
-    bbox_dict = sdata['table'].uns.get('sections_bboxes', None)
+    landmarks = landmarks.copy()   # never mutate the caller's DataFrame
 
-    if bbox_dict is not None and str(section_n) in bbox_dict:
-        # Paired: invert within image space FIRST, then scale to full slide + offset
+    if is_paired:
+        # Invert in TIFF pixel space *before* scaling to the full slide
         if invert_y:
-            landmarks['xenium_y'] = landmarked_image_shape[0] - landmarks['xenium_y']
-        
-        section_bbox = bbox_dict[str(section_n)]
-        bbox_xmin = section_bbox['x_min']
-        bbox_ymin = section_bbox['y_min']
-        full_slide_shape_y = np.max([bbox['y_max'] for bbox in bbox_dict.values()])
-        full_slide_shape_x = np.max([bbox['x_max'] for bbox in bbox_dict.values()])
-        scale_factor_y = full_slide_shape_y / landmarked_image_shape[0]
-        scale_factor_x = full_slide_shape_x / landmarked_image_shape[1]
-        print(f"Paired section — full slide shape: {[full_slide_shape_y, full_slide_shape_x]}")
+            landmarks['xenium_y'] = lm_H - landmarks['xenium_y']
+
+        section_bbox   = bbox_dict[section_key]
+        bbox_xmin      = section_bbox['x_min']
+        bbox_ymin      = section_bbox['y_min']
+        full_slide_H   = np.max([b['y_max'] for b in bbox_dict.values()])
+        full_slide_W   = np.max([b['x_max'] for b in bbox_dict.values()])
+        scale_factor_y = full_slide_H / lm_H
+        scale_factor_x = full_slide_W / lm_W
+        # For paired TIFFs landmarks are in the downsampled-TIFF pixel space;
+        # the effective scale-to-fullres is the same ratio used above.
+        global_tf      = Scale([scale_factor_x, scale_factor_y], axes=('x', 'y'))
+        print(f"Paired section — full slide shape: {[full_slide_H, full_slide_W]}")
         print(f"Image downsampled by: (yx) [{scale_factor_y:.4f}, {scale_factor_x:.4f}]")
-        print(f"Section bbox offset: {section_bbox}")
+        print(f"Section bbox: {section_bbox}")
     else:
-        # Standalone: scale to full section first, then invert within section space
-        scale_factor_y = section_shape_y / landmarked_image_shape[0]
-        scale_factor_x = section_shape_x / landmarked_image_shape[1]
-        print(f"Standalone section — section array shape: {[section_shape_y, section_shape_x]}")
-        print(f"Image downsampled by: (yx) [{scale_factor_y:.4f}, {scale_factor_x:.4f}]")
+        section_bbox = None
+        bbox_xmin    = 0
+        bbox_ymin    = 0
 
-    landmarks['xenium_x'] = landmarks['xenium_x'] * scale_factor_x
-    landmarks['xenium_y'] = landmarks['xenium_y'] * scale_factor_y
-    landmarks['xenium_x'] = landmarks['xenium_x'] - bbox_xmin
-    landmarks['xenium_y'] = landmarks['xenium_y'] - bbox_ymin
+        # ── Match TIFF to a morphology_focus pyramid level ────────────────
+        morph = sdata['morphology_focus']
+        matched_level = matched_level_idx = None
+        for lvl_idx, (lvl, s_l) in enumerate(morph.items()):
+            level_shape = tuple(s_l.image.shape[-2:])     
+            if set(level_shape) == set((lm_H, lm_W)):    
+                matched_level     = lvl
+                matched_level_idx = lvl_idx
+                break
 
-    if bbox_dict is None or str(section_n) not in bbox_dict:
-        # Standalone: invert after scaling, using full section height
-        if invert_y:
-            landmarks['xenium_y'] = section_shape_y - landmarks['xenium_y']
+        if matched_level_idx is not None:
+            matched_da = sd.get_pyramid_levels(morph, n=matched_level_idx)
+            global_tf  = get_transformation(matched_da, to_coordinate_system='global')
+            mat        = global_tf.to_affine_matrix(input_axes=('x', 'y'),
+                                                    output_axes=('x', 'y'))
+            scale_factor_x = float(mat[0, 0])
+            scale_factor_y = float(mat[1, 1])
+            print(f"Standalone — matched pyramid level '{matched_level}'  "
+                  f"(TIFF {lm_H}×{lm_W})")
+            print(f"Scale from stored transform (yx): "
+                  f"[{scale_factor_y:.4f}, {scale_factor_x:.4f}]")
+        else:
+            # Fallback: compute ratio from cell_labels full-res shape
+            cell_labels    = sd.get_pyramid_levels(sdata['cell_labels'], n=0)
+            sec_H = int(cell_labels.data.shape[-2])
+            sec_W = int(cell_labels.data.shape[-1])
+            scale_factor_y = sec_H / lm_H
+            scale_factor_x = sec_W / lm_W
+            global_tf      = Scale([scale_factor_x, scale_factor_y], axes=('x', 'y'))
+            print(f"Standalone — no matching morphology pyramid level found; "
+                  f"falling back to cell_labels ratio")
+            print(f"Image downsampled by: (yx) [{scale_factor_y:.4f}, {scale_factor_x:.4f}]")
 
-    landmarks_tf_info = {'scale_factor_x': scale_factor_x, 
-                         'scale_factor_y': scale_factor_y, 
-                         'bbox': bbox_dict[str(section_n)] if bbox_dict is not None and str(section_n) in bbox_dict else None,
-                         'fullres_pixel_size': sdata['table'].uns['section_metadata']['pixel_size']}
+    # ── Offset + optional invert ──────────────────────────────────────────
+    # The bbox is expressed in full-res pixel space; dividing by scale_factor
+    # converts it to matched-level space so it can be applied directly.
+    # For standalone sections bbox_{x,y}min = 0, so this is a no-op.
+    # Equivalent to: scale → subtract bbox → scale back → same as subtracting bbox/scale.
+    landmarks['xenium_x'] -= bbox_xmin / scale_factor_x
+    landmarks['xenium_y'] -= bbox_ymin / scale_factor_y
 
+    # Standalone invert: mirror in matched-level space.
+    # fullres_H / scale_factor_y = lm_H (by construction), so this simplifies
+    # to lm_H - y, identical to the paired branch's pre-scale inversion.
+    if not is_paired and invert_y:
+        landmarks['xenium_y'] = lm_H - landmarks['xenium_y']
+
+    landmarks_tf_info = {
+        'scale_factor_x':     scale_factor_x,
+        'scale_factor_y':     scale_factor_y,
+        'matched_level_transforms': {'global': global_tf},
+        'bbox':               section_bbox,
+        'pixel_size': sdata['table'].uns['section_metadata']['pixel_size'],
+    }
     return landmarks, landmarks_tf_info
 

@@ -92,13 +92,6 @@ def get_fov_sdata(
         else:
             filtered_points[el] = pts
 
-    # spatialdata's bounding_box_query does not support "case 2":
-    # a 2D element (data_dim=2) with a 3D lifting transformation (rank-2 map to 3D
-    # czstack space, transform_coordinate_length=3).  Such elements come from 2D
-    # Xenium section images/labels that align_section_to_zstack registered in the
-    # czstack_microns coordinate system.  They don't need spatial filtering here
-    # (they are already precisely placed in czstack space), so we remove them
-    # before the bounding-box query and re-attach them afterwards.
     def _is_2d_element(el):
         """Return True if the element has no 'z' spatial dimension."""
         if hasattr(el, 'dims'):
@@ -907,7 +900,7 @@ def add_napari_colormaps(
     -----------------------------
     Writes a ``'{column}{suffix}'`` column (default ``'{column}_color'``) into
     the Dask DataFrame with a hex string per row.  In napari you can then choose
-    this color column to directly colour individual transcripts by gene/feature.
+    this color column to directly color individual transcripts by gene/feature.
 
     Parameters
     ----------
@@ -915,17 +908,17 @@ def add_napari_colormaps(
     column_colors : dict
         ``{column_name: color_spec}`` where *color_spec* is one of:
 
-        * **dict** ``{category_value: color}`` — explicit per-value colours
-          (hex strings, RGB tuples, or matplotlib named colours).
-        * **str** — a matplotlib colormap name; colours are auto-assigned to
+        * **dict** ``{category_value: color}`` — explicit per-value colors
+          (hex strings, RGB tuples, or matplotlib named colors).
+        * **str** — a matplotlib colormap name; colors are auto-assigned to
           sorted unique category values.
-        * **list** — colours in the same order as the sorted unique categories
+        * **list** — colors in the same order as the sorted unique categories
           (or ``table.obs[col].cat.categories`` for table columns).
 
     table_key : str
         Key of the AnnData table to update.  Default ``'table'``.
     points_elements : list[str] | None
-        Points element names to add colour columns to.
+        Points element names to add color columns to.
         ``None`` → every element whose name starts with ``'transcripts'``.
     points_color_col_suffix : str
         Suffix appended to the column name when writing into points DataFrames.
@@ -941,7 +934,7 @@ def add_napari_colormaps(
     >>> add_napari_colormaps(
     ...     sdata,
     ...     column_colors={
-    ...         # Cell-type column in table — explicit colours
+    ...         # Cell-type column in table — explicit colors
     ...         'subclass_name': {'L2/3 IT': '#e41a1c', 'Pvalb': '#377eb8', 'L5 IT': '#4daf4a'},
     ...         # Another column — auto-assign from a matplotlib cmap
     ...         'broad_class': 'tab10',
@@ -1041,7 +1034,7 @@ def add_napari_colormaps(
             sdata.points[pt_key] = pts
             print(
                 f"  [colormaps] points['{pt_key}']['{color_col}'] → "
-                f"{len(color_map)} gene colours"
+                f"{len(color_map)} gene colors"
             )
 
     return sdata

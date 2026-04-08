@@ -37,6 +37,13 @@ from spatialdata.models import (
 
 from xenium_analysis_tools.utils.sd_utils import (
     add_micron_coord_sys,
+    get_microns_scales,
+    _is_multiscale,
+    drop_sdata_elements,
+    get_spatial_elements,
+    get_single_scale,
+    separate_channels,
+    rename_coordinate_systems_manual
 )
 
 def get_zstack_zarr(alignment_folder, paths, zstack_fov_size=None):
@@ -62,7 +69,7 @@ def get_zstack_zarr(alignment_folder, paths, zstack_fov_size=None):
         print(f"Loading existing z-stack zarr: {zstacks_zarrs[0]}")
         zstack_path = zstacks_zarrs[0]
     elif len(zstacks_zarrs) > 1:
-        print(f"Multiple z-stacks available: {[z for z in zstacks_zarrs]}")
+        print(f"Multiple z-stacks available: {[z.name for z in zstacks_zarrs]}")
         zstack_path = zstack_folder / f'zstack_{zstack_fov_size}.zarr'
         print(f"Loading z-stack with FOV size {zstack_fov_size} from: {zstack_path}")
 
@@ -100,6 +107,226 @@ def format_czstack(sdata,
         sdata[f"{lab.split('_')[0]}_table"] = lab_table
 
     return sdata
+
+####### Functions to find transforms ##########
+def get_affine_from_landmarks_flat(moving_coords, ref_coords):
+    moving_2d = moving_coords[:, :2]
+    ref_2d = ref_coords[:, :2]
+    n = moving_2d.shape[0]
+    A_xy = np.hstack([moving_2d, np.ones((n, 1))])
+    result, _, _, _ = np.linalg.lstsq(A_xy, ref_2d, rcond=None)
+
+    # Z offset: mean difference between ref and moving Z coords
+    # mat[2,2] = 1.0 keeps matrix invertible (required by Napari)
+    z_offset = float(np.mean(ref_coords[:, 2] - moving_coords[:, 2]))
+
+    mat = np.eye(4)
+    mat[0, 0] = result[0, 0]; mat[0, 1] = result[1, 0]; mat[0, 3] = result[2, 0]
+    mat[1, 0] = result[0, 1]; mat[1, 1] = result[1, 1]; mat[1, 3] = result[2, 1]
+    mat[2, 2] = 1.0   # MUST be 1.0 - keeps matrix invertible for Napari rendering
+    mat[2, 3] = z_offset
+
+    return Affine(mat, input_axes=('x', 'y', 'z'), output_axes=('x', 'y', 'z'))
+
+def tilt_affines(moving_pts, fixed_pts, flat_affine):
+    # moving_pts = Xenium (2D: x, y, 0)
+    # fixed_pts = CZStack (3D: x, y, z)
+    
+    # Fit Z_stack = a*X_xe + b*Y_xe + c
+    A = np.column_stack([moving_pts[:, 0], moving_pts[:, 1], np.ones(len(moving_pts))])
+    coeffs, _, _, _ = lstsq(A, fixed_pts[:, 2])
+    a, b, c = coeffs
+    
+    # Build the 3D matrix using the 2D XY results
+    tilt_mat = np.array(flat_affine.matrix).copy()
+    tilt_mat[2, 0] = a   # Effect of Xenium X on Stack Z
+    tilt_mat[2, 1] = b   # Effect of Xenium Y on Stack Z
+    tilt_mat[2, 2] = 1.0 # Keeps matrix invertible
+    tilt_mat[2, 3] = c   # The base Z-slice offset
+    
+    return Affine(tilt_mat, input_axes=('x', 'y', 'z'), output_axes=('x', 'y', 'z'))
+
+def _extract_2d_affine_at_z0(affine_3d):
+    """Reduce a 3D Affine(x,y,z → x,y,z) to a 2D Affine(x,y → x,y) evaluated at z=0.
+
+    A 2D image has no z dimension, so z=0 implicitly.  The z column of the 3D matrix
+    contributes nothing (mat[:,2] * 0 = 0), so only the x, y, and translation columns
+    matter.  The resulting 3×3 matrix is square and invertible, allowing
+    spatialdata's sd.transform() inverse-mapping to work on 2D raster elements.
+
+    The z output row (row 2 of the 3D affine) is dropped because raster resampling of a
+    2D image never queries a z output — spatialdata always calls
+    transformation.to_affine_matrix(input_axes=element.dims, output_axes=element.dims),
+    and a 2D element has dims=(c,y,x) with no z.
+    """
+    m = np.array(affine_3d.matrix)   # shape (4, 4) for (x,y,z)→(x,y,z)
+    mat_2d = np.array([
+        [m[0, 0], m[0, 1], m[0, 3]],   # x_out = m00*x + m01*y  (z term = 0)
+        [m[1, 0], m[1, 1], m[1, 3]],   # y_out = m10*x + m11*y
+        [0.0,     0.0,     1.0     ],
+    ])
+    return Affine(mat_2d, input_axes=('x', 'y'), output_axes=('x', 'y'))
+
+
+def add_affine_to_element(element, affine_tf, coord_sys_name,
+                          microns_tf=None, microns_tf_position='before',
+                          overwrite_existing=False):
+    """
+    microns_tf_position: 'before' puts microns_tf before affine_tf (section px → µm → czstack px)
+                         'after'  puts microns_tf after  affine_tf (section px → czstack px → czstack µm)
+
+    For 2D images (axes c, y, x) the section-to-czstack affine is defined over (x, y, z).
+    When spatialdata composes a (c,y,x) scale with an (x,y,z)→(x,y,z) affine it expands
+    the axis set to (c,x,y,z) and produces a non-square 5×4 matrix that np.linalg.inv()
+    cannot invert, causing a LinAlgError in sd.transform().
+
+    Fix: for 2D elements we extract the XY-only 2D affine from the 3D one (evaluated at
+    z=0) and use a matching 2D microns scale.  This keeps every sub-matrix square.
+    """
+    def _is_2d(el):
+        axes = tuple(el.dims) if hasattr(el, 'dims') else ()
+        return 'z' not in axes and 'y' in axes and 'x' in axes
+
+    def _reduce_microns_to_2d(mt):
+        """Strip z from a microns Scale so it stays in (x,y) space."""
+        if mt is None or not hasattr(mt, 'axes'):
+            return mt
+        xy_scale = [mt.scale[list(mt.axes).index(ax)] for ax in ('x', 'y') if ax in mt.axes]
+        if len(xy_scale) == 2:
+            return Scale(xy_scale, axes=('x', 'y'))
+        return mt
+
+    def _try_combine_scales(s1, s2):
+        """Merge two Scale transforms into one when they share the same axes."""
+        if isinstance(s1, Scale) and isinstance(s2, Scale) and s1.axes == s2.axes:
+            return Scale([a * b for a, b in zip(s1.scale, s2.scale)], axes=s1.axes)
+        return None
+
+    def _build_tf(tf_to_fullres, element_obj):
+        af = affine_tf
+        mt = microns_tf
+        # 2D image + 3D affine: reduce both to 2D so all sub-matrices stay square
+        if _is_2d(element_obj) and hasattr(af, 'input_axes') and af.input_axes == ('x', 'y', 'z'):
+            af = _extract_2d_affine_at_z0(af)
+            mt = _reduce_microns_to_2d(mt)
+        if mt is not None:
+            if microns_tf_position == 'after':
+                return Sequence([tf_to_fullres, af, mt])
+            else:
+                # tf_to_fullres and mt are adjacent Scales — merge when possible
+                combined = _try_combine_scales(tf_to_fullres, mt)
+                if combined is not None:
+                    return Sequence([combined, af])
+                return Sequence([tf_to_fullres, mt, af])
+        return Sequence([tf_to_fullres, af])
+
+    if _is_multiscale(element):
+        for n_l, level in enumerate(element.keys()):
+            element_obj = sd.get_pyramid_levels(element, n=n_l)
+            tf_to_fullres = get_transformation(element_obj, to_coordinate_system='global')
+            if isinstance(tf_to_fullres, Identity):
+                tf_to_fullres = Scale([1.0, 1.0, 1.0], axes=('x', 'y', 'z'))
+            if coord_sys_name in element_obj.attrs['transform'] and not overwrite_existing:
+                continue
+            set_transformation(element_obj, _build_tf(tf_to_fullres, element_obj),
+                               to_coordinate_system=coord_sys_name)
+    else:
+        element_obj = element
+        tf_to_fullres = get_transformation(element_obj, to_coordinate_system='global')
+        if isinstance(tf_to_fullres, Identity):
+            tf_to_fullres = Scale([1.0, 1.0, 1.0], axes=('x', 'y', 'z'))
+        if coord_sys_name in element_obj.attrs['transform'] and not overwrite_existing:
+            return
+        set_transformation(element_obj, _build_tf(tf_to_fullres, element_obj),
+                           to_coordinate_system=coord_sys_name)
+
+def get_alignment_transforms(landmarks):
+    """
+    Compute czstack ↔ section affine transforms from a landmarks DataFrame.
+
+    Parameters
+    ----------
+    landmarks : pd.DataFrame or dask DataFrame
+        Must contain columns czstack_x/y/z and x/y/z (or xenium_x/y/z).
+
+    Returns
+    -------
+    section_affines : dict
+        Four affine matrices: flat and full (tilt-aware) in both directions.
+    """
+    # ── 1. Materialise dask DataFrames ────────────────────────────────────
+    try:
+        import dask.dataframe as dd
+        if isinstance(landmarks, dd.DataFrame):
+            landmarks = landmarks.compute()
+    except ImportError:
+        pass
+
+    if landmarks is None or (hasattr(landmarks, 'empty') and landmarks.empty):
+        raise ValueError("landmarks is None or empty — cannot compute affines")
+
+    # ── 2. Normalize column names: xenium_x/y/z → x/y/z ─────────────────
+    rename_map = {}
+    if 'xenium_x' in landmarks.columns and 'x' not in landmarks.columns:
+        rename_map['xenium_x'] = 'x'
+    if 'xenium_y' in landmarks.columns and 'y' not in landmarks.columns:
+        rename_map['xenium_y'] = 'y'
+    if 'xenium_z' in landmarks.columns and 'z' not in landmarks.columns:
+        rename_map['xenium_z'] = 'z'
+    if rename_map:
+        landmarks = landmarks.rename(columns=rename_map)
+
+    # ── 3. Validate required columns are present ──────────────────────────
+    required = {'czstack_x', 'czstack_y', 'czstack_z', 'x', 'y', 'z'}
+    missing  = required - set(landmarks.columns)
+    if missing:
+        raise ValueError(f"landmarks is missing required columns: {missing}")
+
+    # ── 4. Extract coordinate arrays ──────────────────────────────────────
+    czstack_lm = landmarks[['czstack_x', 'czstack_y', 'czstack_z']].values.astype(float)
+    xenium_lm  = landmarks[['x', 'y', 'z']].values.astype(float)
+
+    # ── 4b. Normalize section landmarks to full-res (global) pixel space ──
+    # Landmarks are stored in matched-pyramid-level pixel space, with the
+    # 'global' transform (e.g. Scale([4, 4])) recording the level→full-res
+    # scale factor.  add_affine_to_element prepends that same scale as the
+    # first step of every stored transform so that level-N element pixels are
+    # upscaled to full-res before the Affine is applied.  The Affine must
+    # therefore be fit in *full-res* pixel space so the two match.
+    #
+    # Without this step the Affine is fit on level-2 coords (0..~2500) but
+    # receives level-2 × 4 = full-res (0..~10000) at apply time → 4× wrong
+    # output coordinates → section appears 4× too large in czstack_microns.
+    try:
+        lm_global_tf = get_transformation(landmarks, to_coordinate_system='global')
+        if lm_global_tf is not None and not isinstance(lm_global_tf, Identity):
+            if isinstance(lm_global_tf, Scale):
+                axes = list(lm_global_tf.axes)
+                sx = float(lm_global_tf.scale[axes.index('x')]) if 'x' in axes else 1.0
+                sy = float(lm_global_tf.scale[axes.index('y')]) if 'y' in axes else 1.0
+            else:
+                mat = lm_global_tf.to_affine_matrix(input_axes=('x', 'y'),
+                                                     output_axes=('x', 'y'))
+                sx, sy = float(mat[0, 0]), float(mat[1, 1])
+            xenium_lm = xenium_lm.copy()
+            xenium_lm[:, 0] *= sx
+            xenium_lm[:, 1] *= sy
+    except Exception:
+        pass   # if transform metadata is absent, use raw coordinates
+
+    # ── 5. Compute flat affines once, reuse for tilt affines ──────────────
+    czstack_to_section_flat = get_affine_from_landmarks_flat(czstack_lm, xenium_lm)
+    section_to_czstack_flat = get_affine_from_landmarks_flat(xenium_lm, czstack_lm)
+
+    section_affines = {
+        'czstack_to_section_affine_flat': czstack_to_section_flat,
+        'section_to_czstack_affine_flat': section_to_czstack_flat,
+        'czstack_to_section_full_affine': tilt_affines(czstack_lm, xenium_lm,
+                                                        czstack_to_section_flat),
+        'section_to_czstack_full_affine': tilt_affines(xenium_lm, czstack_lm,
+                                                        section_to_czstack_flat),
+    }
+    return section_affines       
 
 def adjust_3d_images_z_scaling(sdata, sections_depth, elements_3d=['dapi_zstack'], center_z=True):
     """
@@ -294,402 +521,7 @@ def make_element_3d(
     
     return sdata
 
-####### QC alignment #########
-def get_section_z_stats(affines_dict, landmarks_dict, czstack_shape_yx=(512, 512)):
-    y_max, x_max = czstack_shape_yx
-    
-    # FOV corners in czstack pixels
-    fov_corners_czstack = np.array([
-        [0,     0,     0, 1],
-        [x_max, 0,     0, 1],
-        [0,     y_max, 0, 1],
-        [x_max, y_max, 0, 1],
-    ])  # columns: x, y, z, 1
 
-    results = {}
-    for s_n, affines in affines_dict.items():
-        tilt = affines['section_to_czstack_full_affine']
-        if hasattr(landmarks_dict[s_n], 'compute'):
-            landmarks = landmarks_dict[s_n].compute()
-        else:
-            landmarks = landmarks_dict[s_n]
-        czstack_pts = landmarks[['czstack_x', 'czstack_y', 'czstack_z']].values
-        if isinstance(tilt, dict):
-            tilt = Affine(
-                matrix=np.array(tilt['matrix']),
-                input_axes=tuple(tilt['input_axes']),
-                output_axes=tuple(tilt['output_axes'])
-            )
-        mat = tilt.matrix  # input_axes=(x,y,z)
-
-        # Invert to go czstack -> section pixels, then forward to get z at FOV corners
-        inv_mat = np.linalg.inv(mat)
-        
-        # Map czstack FOV corners -> section pixels
-        section_corners = (inv_mat @ fov_corners_czstack.T).T  # (4, 4)
-        
-        # Map those section pixels -> czstack z via forward affine
-        fwd = np.zeros((4, 4))
-        fwd[:, 3] = 1
-        xi = list(tilt.input_axes).index('x')
-        yi = list(tilt.input_axes).index('y')
-        zi = list(tilt.input_axes).index('z')
-        for i in range(4):
-            fwd[i, xi] = section_corners[i, xi]
-            fwd[i, yi] = section_corners[i, yi]
-            fwd[i, zi] = 0
-        z_out = (mat @ fwd.T).T[:, list(tilt.output_axes).index('z')]
-        
-        # Landmark-derived z centroid
-        z_centroid_from_landmarks = float(np.mean(czstack_pts[:, 2]))
-        
-        # Z at the center of the FOV
-        center = np.array([[x_max/2, y_max/2, 0, 1]])
-        center_section = (inv_mat @ center.T).T
-        center_fwd = np.zeros((1, 4)); center_fwd[0, 3] = 1
-        center_fwd[0, xi] = center_section[0, xi]
-        center_fwd[0, yi] = center_section[0, yi]
-        center_fwd[0, zi] = 0
-        z_at_center = float((mat @ center_fwd.T).T[0, list(tilt.output_axes).index('z')])
-        
-        results[s_n] = {
-            'z_centroid_landmarks': z_centroid_from_landmarks,
-            'z_at_fov_center':      z_at_center,
-            'z_min_in_fov':         float(z_out.min()),
-            'z_max_in_fov':         float(z_out.max()),
-            'z_span_in_fov':        float(z_out.max() - z_out.min()),
-            'tilt_deg':             float(np.degrees(np.arctan(
-                                        np.sqrt(mat[2,0]**2 + mat[2,1]**2) / abs(mat[2,2])
-                                    ))),
-        }
-    return results
-
-def print_z_stats_and_check_overlaps(results, 
-                                      czstack_pixel_um=0.78125,
-                                      czstack_z_um_per_plane=1.0,
-                                      sections_depth_um=20.0,
-                                      z_units='planes'):
-    """
-    Parameters
-    ----------
-    results : dict from get_section_z_stats
-        z values are in czstack planes (z_um_per_plane = 1.0 for this dataset)
-    czstack_pixel_um : float
-        xy pixel size in µm (default 0.78125)
-    czstack_z_um_per_plane : float
-        z step size in µm per plane (default 1.0)
-    sections_depth_um : float
-        expected physical section thickness in µm
-    z_units : str
-        'planes' or 'microns' — controls display units for z values.
-        For this dataset they are equivalent (1 plane = 1 µm) but
-        labeling them correctly avoids ambiguity.
-    """
-    assert z_units in ('planes', 'microns'), "z_units must be 'planes' or 'microns'"
-    zu = 'µm' if z_units == 'microns' else 'pl'
-
-    # Convert planes → µm if requested
-    scale = czstack_z_um_per_plane if z_units == 'microns' else 1.0
-
-    print(f"{'Sec':>4} {'z_lm_centroid':>16} {'z_fov_center':>14} "
-          f"{'z_min':>9} {'z_max':>9} {'z_span':>9} {'tilt°':>6}")
-    print(f"{'':>4} {'('+zu+')':>16} {'('+zu+')':>14} "
-          f"{'('+zu+')':>9} {'('+zu+')':>9} {'('+zu+')':>9}")
-    print("-" * 68)
-    for s_n, r in sorted(results.items()):
-        print(f"{s_n:>4} "
-              f"{r['z_centroid_landmarks']*scale:>16.1f} "
-              f"{r['z_at_fov_center']*scale:>14.1f} "
-              f"{r['z_min_in_fov']*scale:>9.1f} "
-              f"{r['z_max_in_fov']*scale:>9.1f} "
-              f"{r['z_span_in_fov']*scale:>9.1f} "
-              f"{r['tilt_deg']:>6.2f}°")
-
-    print(f"\nOverlap check (consecutive sections):")
-    print(f"Note: z values are in czstack {z_units} "
-          f"({czstack_z_um_per_plane} µm/plane, "
-          f"xy pixel = {czstack_pixel_um} µm)")
-
-    sorted_sections = sorted(results.keys())
-    for i in range(len(sorted_sections) - 1):
-        s_a = sorted_sections[i]
-        s_b = sorted_sections[i + 1]
-
-        # Separation in planes (raw from affine), then convert to µm
-        sep_planes = abs(results[s_b]['z_at_fov_center'] - 
-                         results[s_a]['z_at_fov_center'])
-        sep_um     = sep_planes * czstack_z_um_per_plane
-        min_sep_um = sections_depth_um
-
-        # Overlap test in planes (raw units, no conversion needed)
-        fov_overlap = results[s_a]['z_max_in_fov'] > results[s_b]['z_min_in_fov']
-
-        print(f"  Sections {s_a}→{s_b}: "
-              f"separation = {sep_planes:.1f} pl "
-              f"= {sep_um:.1f} µm  "
-              f"(min expected {min_sep_um:.1f} µm)  "
-              f"{'⚠  FOV ranges overlap' if fov_overlap else '✓  non-overlapping'}")
-
-        results[s_a]['overlap_with_next']       = fov_overlap
-        results[s_a]['separation_planes_to_next'] = sep_planes
-        results[s_a]['separation_um_to_next']     = sep_um
-
-    results[sorted_sections[-1]]['overlap_with_next']         = False
-    results[sorted_sections[-1]]['separation_planes_to_next'] = None
-    results[sorted_sections[-1]]['separation_um_to_next']     = None
-
-    return results
-
-def find_landmark_outliers(landmarks):
-      if isinstance(landmarks, dd.DataFrame):
-            lm = landmarks.compute()
-      else:
-            lm = landmarks
-      
-      cz_z = lm['czstack_z'].values
-
-      # Identify outliers: landmarks more than 2 std from mean
-      mean_z, std_z = cz_z.mean(), cz_z.std()
-      outlier_mask = np.abs(cz_z - mean_z) > 2 * std_z
-      print(f"Outlier landmarks ({outlier_mask.sum()} found):")
-      print(lm[outlier_mask][['czstack_x', 'czstack_y', 'czstack_z', 'x', 'y']])
-
-      # Compare affine with and without outliers
-      xenium_pts_all = lm[['x', 'y', 'z']].values
-      czstack_pts_all = lm[['czstack_x', 'czstack_y', 'czstack_z']].values
-
-      xenium_pts_clean = xenium_pts_all[~outlier_mask]
-      czstack_pts_clean = czstack_pts_all[~outlier_mask]
-
-      flat_all   = get_affine_from_landmarks_flat(xenium_pts_all, czstack_pts_all)
-      flat_clean = get_affine_from_landmarks_flat(xenium_pts_clean, czstack_pts_clean)
-      tilt_all   = tilt_affines(xenium_pts_all, czstack_pts_all, flat_all)
-      tilt_clean = tilt_affines(xenium_pts_clean, czstack_pts_clean, flat_clean)
-
-      print(f"\nWith all landmarks:     z_offset = {flat_all.matrix[2,3]:.3f}, "
-            f"tilt = {np.degrees(np.arctan(np.sqrt(tilt_all.matrix[2,0]**2 + tilt_all.matrix[2,1]**2))):.3f}°")
-      print(f"Without outliers:       z_offset = {flat_clean.matrix[2,3]:.3f}, "
-            f"tilt = {np.degrees(np.arctan(np.sqrt(tilt_clean.matrix[2,0]**2 + tilt_clean.matrix[2,1]**2))):.3f}°")
-
-      print(f"\nz_center separation from section 1:")
-      print(f"  With all landmarks:  {flat_all.matrix[2,3] - 67.4:.1f} planes")
-      print(f"  Without outliers:    {flat_clean.matrix[2,3] - 67.4:.1f} planes")
-
-
-def plot_section_positions(results,
-                           czstack_xy_um=0.78125,
-                           czstack_depth_um=450,
-                           czstack_x_shape=512,
-                           pairs=None,
-                           save_path=None):
-    sections = sorted(results.keys())
-
-    if pairs is None:
-        pairs = []
-    paired = {s for p in pairs for s in p}
-    
-    # ── Color assignment ──────────────────────────────────────────────────
-    pair_hues = [
-        ('#4e9af1', '#1a5fa8'),
-        ('#3db87a', '#1a6e46'),
-        ('#e05c5c', '#8a1f1f'),
-        ('#b07fd4', '#6a3a9a'),
-        ('#50b8c4', '#1e6e7a'),
-        ('#f4a742', '#9a5e10'),
-    ]
-    # Bright palette for standalones (or all sections when no pairs given)
-    bright_palette = [
-        '#4e9af1', '#3db87a', '#e05c5c', '#b07fd4',
-        '#50b8c4', '#f4a742', '#f17c4e', '#a8d44e',
-        '#f14eb0', '#4ef1d4', '#d4c44e', '#7a4ef1',
-        '#f1d44e', '#4ef17a', '#f14e7a', '#4eaff1',
-    ]
-
-    colors = {}
-    if pairs:
-        pair_idx = 0
-        for p in pairs:
-            if pair_idx < len(pair_hues):
-                colors[p[0]] = pair_hues[pair_idx][0]
-                colors[p[1]] = pair_hues[pair_idx][1]
-                pair_idx += 1
-        # Standalones get remaining bright colors (skip hues already used by pairs)
-        bright_idx = pair_idx * 2  # rough offset past used pair colors
-        for s_n in sections:
-            if s_n not in colors:
-                colors[s_n] = bright_palette[bright_idx % len(bright_palette)]
-                bright_idx += 1
-    else:
-        # No pairs — assign bright colors directly, evenly spaced
-        for i, s_n in enumerate(sections):
-            colors[s_n] = bright_palette[i % len(bright_palette)]
-
-    # ── Pair membership lookup ────────────────────────────────────────────
-    pair_of = {}  # section → (s_a, s_b) tuple it belongs to
-    for p in pairs:
-        pair_of[p[0]] = p
-        pair_of[p[1]] = p
-
-    fig = plt.figure(figsize=(15, 6.5), facecolor='#0f1117')
-    gs = GridSpec(1, 2, figure=fig, wspace=0.44)
-
-    # ── Left: side view (XZ) ─────────────────────────────────────────────
-    ax_xz = fig.add_subplot(gs[0])
-    ax_xz.set_facecolor('#0f1117')
-    x_fov = czstack_xy_um * czstack_x_shape
-
-    ax_xz.set_xlim(-5, x_fov + 90)
-    ax_xz.set_ylim(czstack_depth_um + 10, -10)
-    ax_xz.set_xlabel('x position in czstack (µm)', color='#8b9ab0', fontsize=9)
-    ax_xz.set_ylabel('z depth (µm)', color='#8b9ab0', fontsize=9)
-    ax_xz.set_title('Side view: section positions and tilt',
-                    color='#e2e8f0', fontsize=10, pad=8)
-    for spine in ax_xz.spines.values():
-        spine.set_edgecolor('#2d3748')
-    ax_xz.tick_params(colors='#8b9ab0', labelsize=8)
-    ax_xz.yaxis.grid(True, color='#2d3748', linewidth=0.5, linestyle='--')
-    ax_xz.set_axisbelow(True)
-
-    # Shade paired z-bands with the pair's light color
-    for s_a, s_b in pairs:
-        if s_a not in results or s_b not in results:
-            continue
-        z_lo = min(results[s_a]['z_min_in_fov'], results[s_b]['z_min_in_fov'])
-        z_hi = max(results[s_a]['z_max_in_fov'], results[s_b]['z_max_in_fov'])
-        ax_xz.axhspan(z_lo, z_hi, xmin=0, xmax=x_fov / (x_fov + 90),
-                      color=colors[s_a], alpha=0.07, zorder=0)
-
-    for s_n in sections:
-        r = results[s_n]
-        col = colors[s_n]
-        is_paired = s_n in paired
-        ax_xz.plot([0, x_fov], [r['z_min_in_fov'], r['z_max_in_fov']],
-                   color=col,
-                   linewidth=2.5 if is_paired else 1.2,
-                   linestyle='-',   # all solid — color encodes pairing
-                   solid_capstyle='round', alpha=0.95)
-        ax_xz.text(x_fov + 5, r['z_at_fov_center'],
-                   f'S{s_n}  {r["z_at_fov_center"]:.0f}µm  {r["tilt_deg"]:.2f}°',
-                   color=col, fontsize=6.5, va='center',
-                   fontweight='bold' if is_paired else 'normal')
-
-    # Legend: one entry per pair + standalones
-    legend_handles = []
-    for idx, (s_a, s_b) in enumerate(pairs):
-        if s_a not in results:
-            continue
-        h = mlines.Line2D([], [], color=colors[s_a], linewidth=2.5,
-                          label=f'S{s_a}+S{s_b} (paired)')
-        legend_handles.append(h)
-    legend_handles.append(
-        mlines.Line2D([], [], color='#9b9b9b', linewidth=1.2,
-                      label='standalone sections')
-    )
-    ax_xz.legend(handles=legend_handles, fontsize=7,
-                 facecolor='#1a2130', edgecolor='#2d3748',
-                 labelcolor='#8b9ab0', loc='lower left')
-
-    # ── Right: z-position chart ───────────────────────────────────────────
-    ax_z = fig.add_subplot(gs[1])
-    ax_z.set_facecolor('#0f1117')
-    for spine in ax_z.spines.values():
-        spine.set_edgecolor('#2d3748')
-    ax_z.tick_params(colors='#8b9ab0', labelsize=8)
-    ax_z.xaxis.grid(True, color='#2d3748', linewidth=0.5, linestyle='--')
-    ax_z.set_axisbelow(True)
-
-    y_pos     = np.arange(len(sections))
-    z_centers = [results[s]['z_at_fov_center'] for s in sections]
-    z_mins    = [results[s]['z_min_in_fov']    for s in sections]
-    z_spans   = [results[s]['z_span_in_fov']   for s in sections]
-    bar_h = 0.5
-
-    # Background band per pair (full x-width, subtle)
-    for s_a, s_b in pairs:
-        if s_a not in sections or s_b not in sections:
-            continue
-        i_a = sections.index(s_a)
-        i_b = sections.index(s_b)
-        ax_z.axhspan(i_a - bar_h, i_b + bar_h,
-                     color=colors[s_a], alpha=0.07, zorder=0)
-
-    # Bars and dots
-    for i, s_n in enumerate(sections):
-        col = colors[s_n]
-        is_paired = s_n in paired
-        ax_z.barh(i, z_spans[i], left=z_mins[i], height=bar_h,
-                  color=col, alpha=0.5,
-                  linewidth=1.5 if is_paired else 0.3,
-                  edgecolor=col if is_paired else 'none')
-        ax_z.scatter(z_centers[i], i, color=col,
-                     s=50 if is_paired else 25, zorder=5,
-                     marker='D' if is_paired else 'o')
-
-    # Pair connectors: bracket between the two center dots
-    for s_a, s_b in pairs:
-        if s_a not in sections or s_b not in sections:
-            continue
-        i_a = sections.index(s_a)
-        i_b = sections.index(s_b)
-        # Use the shared hue (lighter of the two) for the bracket
-        bracket_col = colors[s_a]
-        x_bracket = z_mins[i_a] - 3  # just left of bars
-        ax_z.plot([x_bracket, x_bracket], [i_a, i_b],
-                  color=bracket_col, linewidth=1.5, alpha=0.6, zorder=2)
-        ax_z.plot([x_bracket, x_bracket + 1.5], [i_a, i_a],
-                  color=bracket_col, linewidth=1.5, alpha=0.6, zorder=2)
-        ax_z.plot([x_bracket, x_bracket + 1.5], [i_b, i_b],
-                  color=bracket_col, linewidth=1.5, alpha=0.6, zorder=2)
-
-    # Amber overlap boxes (in data coords before invert_yaxis)
-    overlap_labeled = False
-    for i in range(len(sections) - 1):
-        s_a, s_b = sections[i], sections[i + 1]
-        z_max_a = results[s_a]['z_max_in_fov']
-        z_min_b = results[s_b]['z_min_in_fov']
-        if z_max_a > z_min_b:
-            rect = plt.Rectangle(
-                (z_min_b, i - bar_h / 2),
-                z_max_a - z_min_b,
-                (i + 1 + bar_h / 2) - (i - bar_h / 2),
-                color='#f4a742', alpha=0.22, zorder=1,
-                label='z-range overlap' if not overlap_labeled else None
-            )
-            ax_z.add_patch(rect)
-            overlap_labeled = True
-
-    ax_z.set_yticks(y_pos)
-    ax_z.set_yticklabels([f'S{s}' for s in sections],
-                          fontsize=7.5, color='#8b9ab0')
-    ax_z.set_xlabel('z depth (µm)', color='#8b9ab0', fontsize=9)
-    ax_z.set_title('Section z-positions  (bar = z-span, dot = center)',
-                   color='#e2e8f0', fontsize=10, pad=8)
-
-    z_all_min = min(z_mins) - 5
-    z_all_max = max(r + s for r, s in zip(z_mins, z_spans)) + 5
-    ax_z.set_xlim(z_all_min, z_all_max)
-    ax_z.invert_yaxis()
-
-    paired_bar    = mpatches.Patch(color='#8b9ab0', alpha=0.6,
-                                    label='paired (edged bar, ◆)')
-    solo_bar      = mpatches.Patch(color='#8b9ab0', alpha=0.25,
-                                    label='standalone (plain bar, ●)')
-    overlap_patch = mpatches.Patch(color='#f4a742', alpha=0.4,
-                                    label='z-range overlap')
-    ax_z.legend(handles=[paired_bar, solo_bar, overlap_patch],
-                fontsize=7, facecolor='#1a2130',
-                edgecolor='#2d3748', labelcolor='#8b9ab0',
-                loc='lower right')
-
-    fig.suptitle('Xenium section positions within cortical z-stack',
-                 color='#e2e8f0', fontsize=12, fontweight='bold', y=1.01)
-    plt.tight_layout()
-
-    if save_path:
-        plt.savefig(save_path, dpi=180, bbox_inches='tight',
-                    facecolor=fig.get_facecolor())
-        print(f"Saved to {save_path}")
-    return fig
 
 ######## Main function for taking processed SpatialData object and aligning to cortical z-stack
 def align_section_to_zstack(sdata, 
@@ -703,6 +535,7 @@ def align_section_to_zstack(sdata,
                             add_tx_cell_labels=True,
                             czstack_microns_scale_tf=None,
                             center_z=True,
+                            include_flat=False
                             ):
     # Czstack scale to microns
     if czstack_microns_scale_tf is None:
@@ -739,6 +572,15 @@ def align_section_to_zstack(sdata,
                 coord_sys_name='czstack_microns',
                 microns_tf=czstack_xyz_microns_tf,
                 microns_tf_position='after')
+            if include_flat:
+                add_affine_to_element(sdata[el],
+                    affine_tf=affines['section_to_czstack_affine_flat'],
+                    coord_sys_name='czstack_flat')
+                add_affine_to_element(sdata[el],
+                    affine_tf=affines['section_to_czstack_affine_flat'],
+                    coord_sys_name='czstack_microns_flat',
+                    microns_tf=czstack_xyz_microns_tf,
+                    microns_tf_position='after')
     
     # Keep only one scale level instead of multiscale
     if make_single_scale:
@@ -852,634 +694,252 @@ def write_sdata_elements(sdata, sdata_path, overwrite=False, num_workers=4):
     print(f"Total: {(time.time()-t0)/60:.1f} min")
 
 
-###### QC
-def _pick_existing_key(container, candidates):
-    for k in candidates:
-        if k in container:
-            return k
-    return None
-
-
-def _unwrap_da(element):
-    da = element
-    for _ in range(5):
-        if hasattr(da, 'data') and hasattr(da.data, 'shape'):
-            return da
-        if hasattr(da, 'keys') and callable(da.keys):
-            da = da[next(iter(da.keys()))]
-        else:
-            break
-    return da
-
-def _as_pandas(df_like):
-    if hasattr(df_like, 'compute'):
-        return df_like.compute()
-    return df_like
-
-
-def _resolve_channel_index(da, channel=None):
-    """Resolve channel index for a potentially multi-channel image DataArray-like object."""
-    if not hasattr(da, 'data'):
-        return 0, None
-
-    arr = da.data
-    if arr.ndim != 4:
-        return 0, None
-
-    # Expected order in this pipeline is typically (c, z, y, x).
-    # channel can be int (index) or str (name).
-    if channel is None:
-        return 0, None
-
-    if isinstance(channel, int):
-        idx = int(channel)
-        if idx < 0 or idx >= arr.shape[0]:
-            raise ValueError(f"channel index {idx} out of range [0, {arr.shape[0]-1}]")
-        return idx, None
-
-    if isinstance(channel, str):
-        try:
-            names = list(get_channel_names(da))
-        except Exception:
-            names = []
-        if len(names) == 0:
-            raise ValueError("channel specified by name, but channel names are unavailable for this image")
-        if channel not in names:
-            raise ValueError(f"channel '{channel}' not found. Available: {names}")
-        return int(names.index(channel)), channel
-
-    raise TypeError("channel must be None, int, or str")
-
-
-def _resolve_lift_slab_bounds(sdata, img_da, n_z, section_n, ref_3d_key_type='dapi_zstack'):
+def compare_affines(derived_affine, calculated_affines, xy_scale=1.75,
+                    derived_input_axes='yx', derived_output_axes='yx',
+                    verbose=True):
     """
-    Determine the full-slab z bounds for a (possibly lifted) 2D-to-3D image element.
+    Compare a previously derived 2D affine (3×3, old BigWarp/tiff pipeline) against
+    newly calculated spatialdata Affines.
 
-    Priority:
-      1. Read z_ref_n_planes / z_lift_start_index from img_da.attrs (only available
-         in-memory before a zarr write/read round-trip).
-      2. Infer from the reference 3D image (dapi_zstack for that section): because
-         make_element_3d always places the lifted element at
-         z_start = (ref_nz - target_nz) / 2, we can reconstruct it from n_z alone.
+    Primary question answered:
+        "Does applying section_to_czstack_affine_flat to transform a Xenium section into
+         czstack coordinates produce equivalent results to the previously found affines?"
 
-    Returns (z_ref_n_planes, z_lift_start, lift_mode, z_slab_lo, z_slab_hi).
+    The new pipeline (section_to_czstack_affine_flat) maps:
+        Xenium section pixels (sdata_x, sdata_y) → new zarr czstack pixels (x,y)
+
+    Both were derived from the same BigWarp landmarks, but the czstack pixel spaces differ
+    (different pixel sizes / FOV origins). An isotropic scale ratio between them is therefore
+    expected and does NOT indicate misalignment. Equivalence means:
+
+        1. Same rotation/orientation  (Δangle < 0.5°)
+        2. Isotropic scale ratio      (|sx_ratio − sy_ratio| / max(sx, sy) < 2%)
+               → the two czstack pixel spaces differ only in pixel pitch, not in alignment
+        3. Translation comparison is NOT valid for section→czstack direction, because the
+           two czstack pixel spaces have different origins. For czstack→section direction
+           (shared section pixel space), translation differences DO reflect real offsets.
+
+    Parameters
+    ----------
+    derived_affine : np.ndarray (3,3)
+        Old 2D affine in homogeneous form.  Its axis conventions are given by
+        ``derived_input_axes`` and ``derived_output_axes``.
+    calculated_affines : dict
+        Output of get_alignment_transforms – spatialdata Affine objects keyed by name.
+    xy_scale : float
+        Pixel scale factor applied to z-stack coords in the previously found affines (default 1.75).
+        Divides out the czstack pixel size so scale ratios are dimensionless.
+    derived_input_axes : str, ``'yx'`` (default) or ``'xy'``
+        Axis convention of the *input* (section) side of ``derived_affine``.
+
+        ``'yx'`` — input stored as (sdata_y, sdata_x).  A column-swap P is applied on
+            the right (``M @ P``) to convert to (sdata_x, sdata_y) before comparison.
+            Use when the TIFF and SpatialData image share the same row/column orientation.
+
+        ``'xy'`` — input already in (sdata_x, sdata_y) convention.  No right-swap.
+            Use when the TIFF was **transposed** relative to SpatialData (e.g. 797371
+            where NCC returns 'transpose' and TIF rows = sdata_x, TIF cols = sdata_y).
+
+    derived_output_axes : str, ``'yx'`` (default) or ``'xy'``
+        Axis convention of the *output* (czstack) side of ``derived_affine``.
+
+        ``'yx'`` — output stored as (czstack_y, czstack_x).  A row-swap P is applied on
+            the left (``P @ M``) to convert to (czstack_x, czstack_y).
+
+        ``'xy'`` — output already in (czstack_x, czstack_y) convention.  No left-swap.
+    verbose : bool
+        Print a summary comparison table.
+
+    Returns
+    -------
+    dict with keys:
+        'derived_decomposed'         – scale/angle/translation of the Normalized derived affine
+        'derived_lifted_4x4'         – derived affine lifted to 4×4 (x,y,z) convention
+        'interpretation'             – human-readable verdict
+        'equivalent_to_old_pipeline' – bool: True if rotation matches and scale is isotropic
+        'ok_to_proceed'              – same as equivalent_to_old_pipeline
+        <affine_key>                 – per-affine comparison metrics
     """
-    img_attrs = getattr(img_da, 'attrs', {}) or {}
+    results = {}
 
-    if img_attrs.get('z_ref_n_planes') is not None:
-        # attrs survived (in-memory, not yet round-tripped through zarr)
-        z_ref_n_planes = int(img_attrs['z_ref_n_planes'])
-        z_lift_start   = float(img_attrs.get('z_lift_start_index', 0.0))
-        lift_mode      = img_attrs.get('z_lift_mode', 'reference_slab')
-    else:
-        # attrs lost after zarr round-trip: infer from dapi_zstack reference
-        ref_key = _pick_existing_key(
-            sdata.images,
-            [
-                f'{ref_3d_key_type}-{section_n}' if section_n is not None else None,
-                f'{ref_3d_key_type}_{section_n}' if section_n is not None else None,
-                ref_3d_key_type,
-            ],
-        )
-        if ref_key is not None:
-            ref_da  = _unwrap_da(sdata.images[ref_key])
-            ref_arr = ref_da.data
-            z_ref_n_planes = int(ref_arr.shape[1]) if ref_arr.ndim == 4 else int(ref_arr.shape[0])
-        else:
-            z_ref_n_planes = n_z  # no reference found; treat as full slab
+    # ── 1. Normalize derived affine to (sdata_x, sdata_y) → czstack(x,y) ────
+    P = np.array([[0, 1, 0],
+                  [1, 0, 0],
+                  [0, 0, 1]], dtype=float)
+    M_xy = np.array(derived_affine, dtype=float)
+    if derived_output_axes == 'yx':
+        M_xy = P @ M_xy      # swap output rows: (czstack_y, czstack_x) → (czstack_x, czstack_y)
+    if derived_input_axes == 'yx':
+        M_xy = M_xy @ P      # swap input cols:  (sdata_y, sdata_x) → (sdata_x, sdata_y)
+    S_inv  = np.diag([1.0 / xy_scale, 1.0 / xy_scale, 1.0])
+    M_norm = S_inv @ M_xy    # section(sdata_x, sdata_y) → old_czstack(x,y)
 
-        # Reconstruct z_lift_start from the make_element_3d formula
-        z_lift_start = (z_ref_n_planes - n_z) / 2.0
+    M4 = np.eye(4)
+    M4[0, 0] = M_norm[0, 0]; M4[0, 1] = M_norm[0, 1]; M4[0, 3] = M_norm[0, 2]
+    M4[1, 0] = M_norm[1, 0]; M4[1, 1] = M_norm[1, 1]; M4[1, 3] = M_norm[1, 2]
+    results['derived_lifted_4x4'] = M4
 
-        if n_z == z_ref_n_planes:
-            lift_mode = 'reference_slab'
-        elif n_z == 1:
-            lift_mode = 'centered_plane'
-        else:
-            lift_mode = 'centered_slab'
-
-    # Express slab bounds in *centered* index space where 0 = section midplane.
-    # Every lift mode yields the same full-reference-slab bounds:
-    #   -(z_ref_n_planes-1)/2  …  +(z_ref_n_planes-1)/2
-    # Callers that compute z_idx via mat_cz_inv must convert raw index → centered index by
-    # subtracting  z_idx_center_offset = (z_ref_n_planes-1)/2 - z_lift_start
-    # before comparing against these bounds.
-    center_offset = (z_ref_n_planes - 1) / 2.0
-    z_slab_lo = -center_offset
-    z_slab_hi = +center_offset
-    return z_ref_n_planes, z_lift_start, lift_mode, z_slab_lo, z_slab_hi
-
-
-def alignment_qc_dashboard(
-    sdata,
-    section_n=None,
-    sections_um=20.0,
-    coord_sys='czstack_microns',
-    img_key_type='dapi_zstack',
-    channel=None,
-    y_tolerance=1.0,
-    dapi_signal_percentile=1.0,
-    thickness_tol_um=1.0,
-    max_dapi_pts=120000,
-    max_tx_pts=10000,
-    overlay_space='index',
-    overlay_y_tolerance_idx=0.5,
-    max_tx_overlay_pts=20000,
-    make_plot=True,
-):
-    """
-    Compact QC for one section (for any image channel):
-      1) global z-thickness check (image vs transcripts)
-      2) czstack z-overlap check in matched y-slab
-      3) transform-only center alignment metric in czstack (median z offset)
-      4) XZ overlay in either world (`overlay_space='world'`) or image index (`overlay_space='index'`)
-      5) summary metrics panel
-    """
-    import numpy as np
-    import matplotlib.pyplot as plt
-    import spatialdata as sd
-
-    if overlay_space not in ('world', 'index'):
-        raise ValueError("overlay_space must be 'world' or 'index'")
-
-    # Resolve keys for either per-section or single-section sdata
-    img_key = _pick_existing_key(
-        sdata.images,
-        [
-            f'{img_key_type}_{section_n}' if section_n is not None else None,
-            f'{img_key_type}-{section_n}' if section_n is not None else None,
-            img_key_type,
-        ],
-    )
-    tx_key = _pick_existing_key(
-        sdata.points,
-        [
-            f'transcripts_{section_n}' if section_n is not None else None,
-            f'transcripts-{section_n}' if section_n is not None else None,
-            'transcripts',
-        ],
+    A_d  = M_norm[:2, :2]
+    t_d  = M_norm[:2, 2]
+    sx_d = np.linalg.norm(A_d[:, 0])
+    sy_d = np.linalg.norm(A_d[:, 1])
+    theta_d = np.degrees(np.arctan2(A_d[1, 0], A_d[0, 0]))
+    # Pure rotation matrix of derived affine (normalize out scale)
+    R_d = np.column_stack([A_d[:, 0] / sx_d, A_d[:, 1] / sy_d])
+    results['derived_decomposed'] = dict(
+        scale_x=sx_d, scale_y=sy_d, angle_deg=theta_d,
+        translation_x=t_d[0], translation_y=t_d[1],
+        det_sign=float(np.sign(np.linalg.det(A_d)))
     )
 
-    if img_key is None:
-        raise KeyError(f"Could not find image key for '{img_key_type}' in sdata.images")
-    if tx_key is None:
-        raise KeyError('Could not find a transcript points key in sdata.points')
-
-    img_da = _unwrap_da(sdata.images[img_key])
-    arr = img_da.data
-
-    # Select image channel (if multichannel)
-    ch_idx, ch_name = _resolve_channel_index(img_da, channel=channel)
-    selected_channel = ch_name if ch_name is not None else ch_idx
-
-    if arr.ndim == 4:
-        n_z, n_y, n_x = arr.shape[1], arr.shape[2], arr.shape[3]
-        mid_y = n_y // 2
-        img_xz = arr[ch_idx, :, mid_y, :].compute().astype(np.float32)
-    else:
-        n_z, n_y, n_x = arr.shape[0], arr.shape[1], arr.shape[2]
-        mid_y = n_y // 2
-        img_xz = arr[:, mid_y, :].compute().astype(np.float32)
-
-    # Resolve lift metadata (survives zarr round-trip via dapi_zstack inference)
-    _z_ref_n_planes, _z_lift_start, _lift_mode, _z_slab_lo, _z_slab_hi = \
-        _resolve_lift_slab_bounds(sdata, img_da, n_z, section_n)
-
-    # Affines
-    mat_global = np.array(get_transformation(img_da, to_coordinate_system='global').to_affine_matrix(
-        input_axes=('x', 'y', 'z'), output_axes=('x', 'y', 'z')
-    ))
-    mat_cz = np.array(get_transformation(img_da, to_coordinate_system=coord_sys).to_affine_matrix(
-        input_axes=('x', 'y', 'z'), output_axes=('x', 'y', 'z')
-    ))
-    mat_cz_inv = np.linalg.inv(mat_cz)
-
-    # Image global z support (center-based)
-    z_idx = np.arange(n_z, dtype=float)
-    x0, y0 = n_x / 2.0, n_y / 2.0
-    img_z_global = mat_global[2, 0] * x0 + mat_global[2, 1] * y0 + mat_global[2, 2] * z_idx + mat_global[2, 3]
-    img_span_centers = float(img_z_global.max() - img_z_global.min())
-    # With mps = sections_depth/(n_z-1), the span between plane-centre extremes equals
-    # sections_um exactly (plane 0 at -sections_um/2, plane n_z-1 at +sections_um/2).
-    img_expected_center_span = float(sections_um)
-    img_expected_full_span = float(sections_um)
-
-    # Transcript global support
-    tx_global = _as_pandas(sd.transform(sdata.points[tx_key], to_coordinate_system='global'))
-    tx_span_global = float(tx_global['z'].max() - tx_global['z'].min())
-
-    pass_img_center = abs(img_span_centers - img_expected_center_span) <= thickness_tol_um
-    pass_tx_global = abs(tx_span_global - sections_um) <= thickness_tol_um
-
-    # Build image world XZ at fixed image y-index
-    xx, zz = np.meshgrid(np.arange(n_x, dtype=float), np.arange(n_z, dtype=float))
-    yy = np.full_like(xx, float(mid_y))
-    img_x_cz = mat_cz[0, 0] * xx + mat_cz[0, 1] * yy + mat_cz[0, 2] * zz + mat_cz[0, 3]
-    img_z_cz = mat_cz[2, 0] * xx + mat_cz[2, 1] * yy + mat_cz[2, 2] * zz + mat_cz[2, 3]
-
-    y_slice_world = float(
-        mat_cz[1, 0] * (n_x / 2.0) + mat_cz[1, 1] * mid_y + mat_cz[1, 2] * (n_z / 2.0) + mat_cz[1, 3]
-    )
-
-    flat_i = img_xz.ravel()
-    flat_x = img_x_cz.ravel()
-    flat_z = img_z_cz.ravel()
-    thr = np.percentile(flat_i, dapi_signal_percentile)
-    keep_sig = flat_i > thr
-    sig_idx = np.flatnonzero(keep_sig)
-
-    img_sig_x = flat_x[keep_sig]
-    img_sig_z = flat_z[keep_sig]
-    img_sig_i = flat_i[keep_sig]
-
-    if len(img_sig_i) > max_dapi_pts:
-        rng = np.random.default_rng(42)
-        choose = rng.choice(np.arange(len(img_sig_i)), size=max_dapi_pts, replace=False)
-        img_sig_x = img_sig_x[choose]
-        img_sig_z = img_sig_z[choose]
-        img_sig_i = img_sig_i[choose]
-        sig_idx = sig_idx[choose]
-
-    # Transcript czstack support in matched y-slab + image x support (world-based QC metric)
-    tx_cz = _as_pandas(sd.transform(sdata.points[tx_key], to_coordinate_system=coord_sys))
-    n_tx_total = int(len(tx_cz))
-    tx_mask_y = np.ones(n_tx_total, dtype=bool)
-    if 'y' in tx_cz.columns:
-        tx_mask_y &= np.abs(tx_cz['y'].values - y_slice_world) <= y_tolerance
-
-    tx_mask_x = np.ones(n_tx_total, dtype=bool)
-    if len(img_sig_x) > 0:
-        tx_mask_x &= (tx_cz['x'].values >= img_sig_x.min()) & (tx_cz['x'].values <= img_sig_x.max())
-
-    tx_mask = tx_mask_y & tx_mask_x
-    tx_slab = tx_cz.loc[tx_mask].copy()
-    n_tx_after_y = int(tx_mask_y.sum())
-
-    if len(tx_slab) > max_tx_pts:
-        tx_slab = tx_slab.sample(max_tx_pts, random_state=42)
-
-    img_cz_rng = (float(np.min(img_sig_z)), float(np.max(img_sig_z))) if len(img_sig_z) else (np.nan, np.nan)
-    tx_cz_rng = (float(tx_slab['z'].min()), float(tx_slab['z'].max())) if len(tx_slab) else (np.nan, np.nan)
-
-    if len(img_sig_z) > 10 and len(tx_slab) > 10:
-        i_lo, i_hi = np.percentile(img_sig_z, [0.5, 99.5])
-        t_lo, t_hi = np.percentile(tx_slab['z'].values, [0.5, 99.5])
-        overlap = max(0.0, min(i_hi, t_hi) - max(i_lo, t_lo))
-        union = max(i_hi, t_hi) - min(i_lo, t_lo)
-        overlap_frac = float(overlap / union) if union > 0 else np.nan
-
-        i_med = float(np.median(img_sig_z))
-        t_med = float(np.median(tx_slab['z'].values))
-        median_z_offset_cz = float(t_med - i_med)
-
-        i_q25, i_q75 = np.percentile(img_sig_z, [25, 75])
-        i_iqr = max(float(i_q75 - i_q25), 1e-6)
-        median_z_offset_iqr_norm = float(median_z_offset_cz / i_iqr)
-    else:
-        overlap_frac = np.nan
-        median_z_offset_cz = np.nan
-        median_z_offset_iqr_norm = np.nan
-
-    # Overlay-specific transcript selection (to prevent opposite tilt artifacts)
-    if overlay_space == 'world':
-        overlay_img_x = img_sig_x
-        overlay_img_z = img_sig_z
-        overlay_img_i = img_sig_i
-        overlay_tx_x = tx_slab['x'].values if len(tx_slab) else np.array([])
-        overlay_tx_z = tx_slab['z'].values if len(tx_slab) else np.array([])
-        n_tx_overlay = int(len(overlay_tx_x))
-        overlay_desc = f"world y-slab ±{y_tolerance}"
-    else:
-        # Image points in index XZ (centered: 0 = section midplane)
-        x_idx_flat = xx.ravel()
-        z_idx_flat = zz.ravel()
-        overlay_img_x = x_idx_flat[sig_idx]
-        overlay_img_z = z_idx_flat[sig_idx]  # will be centered below after _z_idx_center_offset is known
-        overlay_img_i = flat_i[sig_idx]
-
-        # Transform a sampled set of transcripts to image index space and filter by y-index
-        if len(tx_cz) > 300000:
-            tx_overlay_df = tx_cz.sample(300000, random_state=42)
-        else:
-            tx_overlay_df = tx_cz
-
-        xyz = tx_overlay_df[['x', 'y', 'z']].to_numpy(dtype=np.float64)
-        xyz1 = np.concatenate([xyz, np.ones((xyz.shape[0], 1), dtype=np.float64)], axis=1)
-        idx_pts = xyz1 @ mat_cz_inv.T
-        tx_xi = idx_pts[:, 0]
-        tx_yi = idx_pts[:, 1]
-        tx_zi = idx_pts[:, 2]
-
-        # Convert raw image-index z to centered-index space (0 = section midplane).
-        _z_idx_center_offset = (_z_ref_n_planes - 1) / 2.0 - _z_lift_start
-        tx_zi = tx_zi - _z_idx_center_offset
-        overlay_img_z = overlay_img_z - _z_idx_center_offset  # center image z indices for plotting
-
-        mask_i = np.abs(tx_yi - mid_y) <= overlay_y_tolerance_idx
-        mask_i &= (tx_xi >= 0) & (tx_xi <= (n_x - 1))
-        mask_i &= (tx_zi >= _z_slab_lo) & (tx_zi <= _z_slab_hi)
-
-        overlay_tx_x = tx_xi[mask_i]
-        overlay_tx_z = tx_zi[mask_i]
-
-        if len(overlay_tx_x) > max_tx_overlay_pts:
-            rng = np.random.default_rng(42)
-            keep = rng.choice(np.arange(len(overlay_tx_x)), size=max_tx_overlay_pts, replace=False)
-            overlay_tx_x = overlay_tx_x[keep]
-            overlay_tx_z = overlay_tx_z[keep]
-
-        n_tx_overlay = int(len(overlay_tx_x))
-        overlay_desc = f"index y-slab ±{overlay_y_tolerance_idx}"
-
-    metrics = {
-        'section_n': section_n,
-        'img_key_type': img_key_type,
-        'img_key': img_key,
-        'channel': selected_channel,
-        'tx_key': tx_key,
-        'sections_um_target': float(sections_um),
-        'n_z_planes': int(n_z),
-        'img_expected_center_span_um': float(img_expected_center_span),
-        'img_expected_full_span_um': float(img_expected_full_span),
-        'img_global_span_um': float(img_span_centers),
-        'tx_global_span_um': float(tx_span_global),
-        'img_center_span_pass': bool(pass_img_center),
-        'tx_global_span_pass': bool(pass_tx_global),
-        'coord_sys': coord_sys,
-        'img_cz_range': img_cz_rng,
-        'tx_cz_range': tx_cz_rng,
-        'overlap_fraction': overlap_frac,
-        'median_z_offset_cz': median_z_offset_cz,
-        'median_z_offset_iqr_norm': median_z_offset_iqr_norm,
-        'n_tx_total': n_tx_total,
-        'n_tx_after_y': n_tx_after_y,
-        'n_tx_in_slab': int(len(tx_slab)),
-        'overlay_space': overlay_space,
-        'n_tx_overlay': n_tx_overlay,
-        'y_tolerance': float(y_tolerance),
-    }
-
-    if make_plot:
-        fig, axes = plt.subplots(2, 2, figsize=(13, 8))
-
-        label_img = f"{img_key_type}[{selected_channel}]" if arr.ndim == 4 else img_key_type
-
-        # (A) Global thickness check — centre both distributions for a span-only comparison
-        # (absolute z positions differ because DAPI global transform was shifted by center_z=True
-        # while transcript native z may have a different z-reference in global space)
-        ax = axes[0, 0]
-        img_z_c = img_z_global - img_z_global.mean()
-        tx_z_c  = tx_global['z'].values - tx_global['z'].values.mean()
-        ax.hist(img_z_c, bins=min(30, n_z), alpha=0.6, density=True, label=f'{label_img} (global, centred)')
-        ax.hist(tx_z_c, bins=40, alpha=0.5, density=True, label='TX (global, centred)')
-        ax.axvline( img_expected_center_span / 2, color='tab:blue',   linestyle='--', linewidth=1, label=f'img span ={img_expected_center_span:.1f}µm')
-        ax.axvline(-img_expected_center_span / 2, color='tab:blue',   linestyle='--', linewidth=1)
-        ax.axvline( sections_um / 2,              color='tab:orange', linestyle='--', linewidth=1, label=f'TX span ={sections_um:.1f}µm')
-        ax.axvline(-sections_um / 2,              color='tab:orange', linestyle='--', linewidth=1)
-        ax.set_title('Global z thickness (centred)')
-        ax.set_xlabel('z − mean(z)  (µm)')
-        ax.set_ylabel('density')
-        ax.legend(fontsize=8)
-
-        # (B) czstack overlap histogram
-        ax = axes[0, 1]
-        if len(img_sig_z) and len(tx_slab):
-            bins = np.linspace(min(np.min(img_sig_z), tx_slab['z'].min()),
-                               max(np.max(img_sig_z), tx_slab['z'].max()), 45)
-            ax.hist(img_sig_z, bins=bins, alpha=0.55, density=True, label=f'{label_img} signal')
-            ax.hist(tx_slab['z'].values, bins=bins, alpha=0.55, density=True, label='TX slab')
-        ax.set_title(f'czstack z overlap (y±{y_tolerance})')
-        ax.set_xlabel(f'z ({coord_sys})')
-        ax.set_ylabel('density')
-        ax.legend(fontsize=8)
-
-        # (C) XZ overlay
-        ax = axes[1, 0]
-        if len(overlay_img_z):
-            ax.scatter(overlay_img_x, overlay_img_z, c=overlay_img_i, s=1, cmap='magma', alpha=0.35, linewidths=0)
-        if len(overlay_tx_z):
-            ax.scatter(overlay_tx_x, overlay_tx_z, s=3, alpha=0.6, c='cyan', linewidths=0)
-        if overlay_space == 'index':
-            ax.set_title('XZ overlay in image index space')
-            ax.set_xlabel('x (image index)')
-            ax.set_ylabel('z (image index)')
-        else:
-            ax.set_title('XZ overlay in czstack world')
-            ax.set_xlabel(f'x ({coord_sys})')
-            ax.set_ylabel(f'z ({coord_sys})')
-
-        # (D) Text summary
-        ax = axes[1, 1]
-        ax.axis('off')
-        _lift_summary = (
-            f"{_lift_mode}  ref_nz={_z_ref_n_planes}  start={_z_lift_start:.1f}\n"
-            f"Slab idx bounds: [{_z_slab_lo:.1f}, {_z_slab_hi:.1f}]\n"
-        ) if _lift_mode != 'reference_slab' else f"{_lift_mode}\n"
-        txt = (
-            f"Section: {section_n if section_n is not None else 'single'}\n"
-            f"Image key: {img_key}\nChannel: {selected_channel}\nTX key: {tx_key}\n"
-            f"Lift: {_lift_summary}\n"
-            f"Image global span: {img_span_centers:.3f} µm\n"
-            f"Image expected (center-span): {img_expected_center_span:.3f} µm\n"
-            f"TX global span: {tx_span_global:.3f} µm\n"
-            f"TX expected: {sections_um:.3f} µm\n\n"
-            f"PASS image center-span: {pass_img_center}\n"
-            f"PASS TX span: {pass_tx_global}\n\n"
-            f"Image cz range: [{img_cz_rng[0]:.2f}, {img_cz_rng[1]:.2f}]\n"
-            f"TX cz range: [{tx_cz_rng[0]:.2f}, {tx_cz_rng[1]:.2f}]\n"
-            f"Overlap fraction: {overlap_frac:.3f}\n"
-            f"Median z offset (TX-image): {median_z_offset_cz:.3f}\n"
-            f"Offset / image IQR: {median_z_offset_iqr_norm:.3f}\n"
-            f"Overlay space: {overlay_space} ({overlay_desc})\n"
-            f"n TX total: {n_tx_total}\n"
-            f"n TX after y-filter: {n_tx_after_y}\n"
-            f"n TX in slab: {len(tx_slab)}\n"
-            f"n TX in overlay: {n_tx_overlay}"
-        )
-        ax.text(0.02, 0.98, txt, va='top', ha='left', fontsize=10, family='monospace')
-
-        plt.tight_layout()
-        plt.show()
-
-    return metrics
-
-def diagnose_transcript_z_within_section(
-    sdata,
-    section_n,
-    img_key_type='rna',
-    coord_sys='czstack_microns',
-):
-    """
-    Check whether transcripts for a section lie within the section's z slab.
-
-    Correctly handles 'centered_plane' and 'centered_slab' lift modes: the out-of-slab
-    count is measured against the FULL REFERENCE SLAB bounds (not the image's n_z planes),
-    so a single-plane centered image does not report 99%+ out of bounds.
-    """
-    import numpy as np
-    import spatialdata as sd
-
-    # Resolve keys
-    img_key = None
-    for k in [f'{img_key_type}-{section_n}', f'{img_key_type}_{section_n}', img_key_type]:
-        if k in sdata.images:
-            img_key = k
-            break
-    tx_key = None
-    for k in [f'transcripts-{section_n}', f'transcripts_{section_n}', 'transcripts']:
-        if k in sdata.points:
-            tx_key = k
-            break
-
-    if img_key is None or tx_key is None:
-        raise KeyError(f'Could not resolve keys. img_key={img_key}, tx_key={tx_key}')
-
-    img_da = _unwrap_da(sdata.images[img_key])
-    arr = img_da.data
-    if arr.ndim == 4:
-        n_z = int(arr.shape[1])
-    elif arr.ndim == 3:
-        n_z = int(arr.shape[0])
-    else:
-        raise ValueError(f'Unsupported image ndim={arr.ndim}')
-
-    # Resolve lift metadata (survives zarr round-trip via dapi_zstack inference)
-    z_ref_n_planes, z_lift_start, lift_mode, z_slab_lo, z_slab_hi = \
-        _resolve_lift_slab_bounds(sdata, img_da, n_z, section_n)
-
-    mat = np.array(
-        get_transformation(img_da, to_coordinate_system=coord_sys).to_affine_matrix(
+    # ── 2. Compare against each calculated affine ────────────────────────────
+    for key, calc_affine in calculated_affines.items():
+        mat4 = np.array(calc_affine.to_affine_matrix(
             input_axes=('x', 'y', 'z'), output_axes=('x', 'y', 'z')
-        ),
-        dtype=np.float64,
+        ))
+        C = np.array([
+            [mat4[0, 0], mat4[0, 1], mat4[0, 3]],
+            [mat4[1, 0], mat4[1, 1], mat4[1, 3]],
+            [0.0,        0.0,        1.0        ],
+        ])
+        A_c = C[:2, :2]
+        t_c = C[:2, 2]
+        sx_c = np.linalg.norm(A_c[:, 0])
+        sy_c = np.linalg.norm(A_c[:, 1])
+        theta_c = np.degrees(np.arctan2(A_c[1, 0], A_c[0, 0]))
+
+        is_same_dir = 'section_to_czstack' in key
+        ref = M_norm if is_same_dir else np.linalg.inv(M_norm)
+
+        sx_ref = np.linalg.norm(ref[:2, 0])
+        sy_ref = np.linalg.norm(ref[:2, 1])
+        sx_ratio = sx_c / sx_ref if sx_ref > 0 else float('nan')
+        sy_ratio = sy_c / sy_ref if sy_ref > 0 else float('nan')
+
+        theta_ref = np.degrees(np.arctan2(ref[1, 0], ref[0, 0]))
+        angle_diff = abs(theta_ref - theta_c)
+        if angle_diff > 180:
+            angle_diff = 360 - angle_diff
+
+        frob   = np.linalg.norm(ref - C)
+        t_diff = np.linalg.norm(ref[:2, 2] - t_c)
+
+        # Scale-invariant rotation comparison: normalize columns, then compare.
+        # This is the meaningful metric for section→czstack, where the two czstack
+        # pixel spaces differ in scale but not in orientation.
+        R_c = np.column_stack([A_c[:, 0] / sx_c, A_c[:, 1] / sy_c]) if (sx_c > 0 and sy_c > 0) else A_c
+        if is_same_dir:
+            rot_only_frob = np.linalg.norm(R_d - R_c)
+        else:
+            # czstack→section: compare inv(R_d) vs R_c  (R_d.T = inv for pure rotation)
+            rot_only_frob = np.linalg.norm(R_d.T - R_c)
+
+        results[key] = dict(
+            direction           = 'section→czstack' if is_same_dir else 'czstack→section',
+            scale_x             = sx_c,
+            scale_y             = sy_c,
+            angle_deg           = theta_c,
+            det_sign            = float(np.sign(np.linalg.det(A_c))),
+            translation_x       = t_c[0],
+            translation_y       = t_c[1],
+            frobenius_diff      = frob,
+            rot_only_frob       = rot_only_frob,   # scale-invariant rotation difference
+            translation_diff_px = t_diff,
+            angle_diff_deg      = angle_diff,
+            scale_x_ratio       = sx_ratio,
+            scale_y_ratio       = sy_ratio,
+            scale_x_diff        = abs(sx_ref - sx_c),
+            scale_y_diff        = abs(sy_ref - sy_c),
+        )
+
+    # ── 3. Equivalence verdict focused on section→czstack_affine_flat ────────
+    # This directly answers: "will applying section_to_czstack_affine_flat produce
+    # the same result as the previously found affines?"
+    s2c_key = next(
+        (k for k in ['section_to_czstack_affine_flat', 'section_to_czstack_full_affine']
+         if k in calculated_affines),
+        next((k for k in calculated_affines if 'section_to_czstack' in k), None)
     )
-    mat_inv = np.linalg.inv(mat)
+    if s2c_key:
+        s2c     = results[s2c_key]
+        sx_r, sy_r = s2c['scale_x_ratio'], s2c['scale_y_ratio']
+        rot_ok      = s2c['angle_diff_deg'] < 0.5
+        rot_exact   = s2c['rot_only_frob'] < 0.01   # pure rotation should be ~0
+        scale_uniform = (not np.isnan(sx_r) and not np.isnan(sy_r)
+                         and abs(sx_r - sy_r) / max(abs(sx_r), abs(sy_r), 1e-9) < 0.02)
+        equivalent = rot_ok and scale_uniform
 
-    tx = sd.transform(sdata.points[tx_key], to_coordinate_system=coord_sys)
-    tx_pdf = tx.compute() if hasattr(tx, 'compute') else tx
+        if equivalent:
+            scale_note = (f'isotropic pixel-size difference between old tiff and new zarr czstack '
+                          f'(sx={sx_r:.3f}, sy={sy_r:.3f}) — expected, does not affect alignment')
+            verdict = (f'EQUIVALENT ✓ — applying {s2c_key} to transform section→czstack '
+                       f'produces the same physical alignment as the previously found affines  |  '
+                       f'Δangle={s2c["angle_diff_deg"]:.3f}°  rot_frob={s2c["rot_only_frob"]:.5f}  '
+                       f'{scale_note}')
+        elif rot_ok and not scale_uniform:
+            verdict = (f'PARTIAL — rotation matches (Δangle={s2c["angle_diff_deg"]:.3f}°) but '
+                       f'anisotropic scale difference (sx={sx_r:.3f} ≠ sy={sy_r:.3f}) — '
+                       f'possible shear between pipelines, review landmarks')
+            equivalent = False
+        else:
+            verdict = (f'MISMATCH ✗ — rotation differs (Δangle={s2c["angle_diff_deg"]:.3f}°, '
+                       f'rot_frob={s2c["rot_only_frob"]:.5f}) — '
+                       f'transforms describe different physical alignments')
+            equivalent = False
+    else:
+        verdict    = 'No section_to_czstack affine found in calculated_affines'
+        equivalent = False
 
-    xyz = tx_pdf[['x', 'y', 'z']].to_numpy(dtype=np.float64)
-    xyz1 = np.concatenate([xyz, np.ones((xyz.shape[0], 1), dtype=np.float64)], axis=1)
-    idx = xyz1 @ mat_inv.T
-    z_idx = idx[:, 2]
+    results['interpretation']             = verdict
+    results['equivalent_to_old_pipeline'] = equivalent
+    results['ok_to_proceed']              = equivalent
 
-    # Convert raw image-index z to centered-index space (0 = section midplane).
-    # Raw z_idx from mat_inv includes the lift offset; subtracting z_idx_center_offset
-    # aligns it with the centered slab bounds from _resolve_lift_slab_bounds.
-    _z_idx_center_offset = (z_ref_n_planes - 1) / 2.0 - z_lift_start
-    z_idx = z_idx - _z_idx_center_offset
+    # ── 4. Print summary ─────────────────────────────────────────────────────
+    if verbose:
+        def _fmt_transform(sx, sy, theta_deg, det_sign):
+            """One-liner describing a 2D linear transform geometrically."""
+            iso = abs(sx - sy) / max(abs(sx), abs(sy), 1e-9) < 0.02
+            sc  = (f"×{0.5*(sx + sy):.3f}  (isotropic)"
+                   if iso else f"sx=×{sx:.3f}, sy=×{sy:.3f}  (anisotropic)")
+            fl  = "none" if det_sign > 0 else "yes"
+            return f"  rotation = {theta_deg:+.1f}°   scale = {sc}   reflection = {fl}"
 
-    # Out-of-bounds relative to the full reference slab, not just this image's n_z planes.
-    out_low  = int(np.sum(z_idx < z_slab_lo))
-    out_high = int(np.sum(z_idx > z_slab_hi))
-    out_any  = out_low + out_high
-    frac_out = float(out_any / len(z_idx)) if len(z_idx) else np.nan
+        d = results['derived_decomposed']
 
-    print(f'Section {section_n}  | image={img_key}  tx={tx_key}')
-    print(f'n_tx={len(z_idx)}  n_z_image={n_z}  lift_mode={lift_mode}')
-    print(f'z_ref_n_planes={z_ref_n_planes}  z_lift_start={z_lift_start:.1f}')
-    print(f'Slab bounds (centered idx space): [{z_slab_lo:.1f}, {z_slab_hi:.1f}]')
-    print(f'z_idx min/max: {z_idx.min():.3f} / {z_idx.max():.3f}')
-    print(f'out_of_slab: {out_any} ({frac_out:.3%})  [low={out_low}, high={out_high}]')
+        if s2c_key and s2c_key in results:
+            s2c       = results[s2c_key]
+            sx_r, sy_r = s2c['scale_x_ratio'], s2c['scale_y_ratio']
+            rot_ok    = s2c['angle_diff_deg'] < 0.5
+            ratio_iso = (not np.isnan(sx_r) and not np.isnan(sy_r)
+                         and abs(sx_r - sy_r) / max(abs(sx_r), abs(sy_r), 1e-9) < 0.02)
+            flip_match = int(s2c['det_sign']) == int(d['det_sign'])
 
-    return {
-        'section_n': section_n,
-        'img_key': img_key,
-        'tx_key': tx_key,
-        'n_tx': int(len(z_idx)),
-        'n_z_image': int(n_z),
-        'lift_mode': lift_mode,
-        'z_ref_n_planes': int(z_ref_n_planes),
-        'z_lift_start': float(z_lift_start),
-        'z_slab_lo': float(z_slab_lo),
-        'z_slab_hi': float(z_slab_hi),
-        'z_idx_min': float(z_idx.min()),
-        'z_idx_max': float(z_idx.max()),
-        'out_of_slab_n': int(out_any),
-        'out_of_slab_fraction': float(frac_out),
-    }
+            print(f"  Transform  (section → czstack):")
+            print(_fmt_transform(s2c['scale_x'], s2c['scale_y'],
+                                 s2c['angle_deg'], s2c['det_sign']))
+            print()
 
+            print(f"  vs. previously found affines  (Normalized):")
+            rot_sym   = '✓' if rot_ok    else '✗'
+            scale_sym = '✓' if ratio_iso else '✗'
+            print(f"    rotation = {d['angle_deg']:+.1f}°   "
+                  f"Δ = {s2c['angle_diff_deg']:.3f}°  {rot_sym}")
+            avg_r      = 0.5 * (sx_r + sy_r)
+            ratio_note = "  (czstack pixel-size offset — expected)" if ratio_iso else ""
+            print(f"    scale ratio = {avg_r:.3f}×  {scale_sym}{ratio_note}")
+            if not flip_match:
+                new_fl = 'yes' if s2c['det_sign'] < 0 else 'none'
+                old_fl = 'yes' if d['det_sign']   < 0 else 'none'
+                print(f"    reflection: new={new_fl}, old={old_fl}  ✗  mismatch")
+        else:
+            print("  (no section→czstack affine found in calculated_affines)")
 
-def alignment_qc_summary_by_section(
-    combined_data,
-    sections,
-    sections_um=20.0,
-    img_key_type='dapi_zstack',
-    channel=None,
-    coord_sys='czstack_microns',
-    y_tolerance=1.0,
-):
-    """Run compact QC across sections and plot a concise summary."""
-    import numpy as np
-    import pandas as pd
-    import matplotlib.pyplot as plt
+        print()
+        if equivalent:
+            print("  → PASS ✓  same physical alignment as previously found affines")
+        elif s2c_key and s2c_key in results and results[s2c_key]['angle_diff_deg'] >= 0.5:
+            print("  → FAIL ✗  rotation mismatch — transforms describe different physical alignments")
+        else:
+            print("  → FAIL ✗  anisotropic scale difference — possible shear, review landmarks")
 
-    rows = []
-    for s_n in sections:
-        try:
-            m = alignment_qc_dashboard(
-                combined_data,
-                section_n=s_n,
-                sections_um=sections_um,
-                img_key_type=img_key_type,
-                channel=channel,
-                coord_sys=coord_sys,
-                y_tolerance=y_tolerance,
-                make_plot=False,
-            )
-            rows.append(m)
-        except Exception as e:
-            rows.append({'section_n': s_n, 'error': str(e)})
-
-    df = pd.DataFrame(rows).sort_values('section_n').reset_index(drop=True)
-
-    ok = df[~df.get('error', pd.Series([None] * len(df))).notna()].copy()
-    if len(ok) == 0:
-        display(df)
-        return df
-
-    fig, axes = plt.subplots(1, 4, figsize=(19, 4))
-
-    # 1) Thickness spans
-    axes[0].plot(ok['section_n'], ok['img_global_span_um'], 'o-', label='Image global span')
-    axes[0].plot(ok['section_n'], ok['tx_global_span_um'], 'o-', label='TX global span')
-    axes[0].axhline(sections_um, linestyle='--', color='k', linewidth=1, label='20 µm target')
-    axes[0].set_title('Global thickness by section')
-    axes[0].set_xlabel('section')
-    axes[0].set_ylabel('span (µm)')
-    axes[0].legend(fontsize=8)
-
-    # 2) Overlap fraction
-    axes[1].bar(ok['section_n'].astype(str), ok['overlap_fraction'])
-    axes[1].set_ylim(0, 1)
-    axes[1].set_title('czstack z overlap fraction')
-    axes[1].set_xlabel('section')
-    axes[1].set_ylabel('overlap (0-1)')
-
-    # 3) transform-only metric (center offset)
-    axes[2].axhline(0.0, linestyle='--', color='k', linewidth=1)
-    axes[2].plot(ok['section_n'], ok['median_z_offset_cz'], 'o-', color='tab:green')
-    axes[2].set_title('Median z offset (TX - image)')
-    axes[2].set_xlabel('section')
-    axes[2].set_ylabel(f'offset ({coord_sys} z units)')
-
-    # 4) czstack ranges
-    i_mins = ok['img_cz_range'].apply(lambda x: x[0])
-    i_maxs = ok['img_cz_range'].apply(lambda x: x[1])
-    t_mins = ok['tx_cz_range'].apply(lambda x: x[0])
-    t_maxs = ok['tx_cz_range'].apply(lambda x: x[1])
-
-    y = np.arange(len(ok))
-    axes[3].hlines(y + 0.12, i_mins, i_maxs, linewidth=3, label='Image')
-    axes[3].hlines(y - 0.12, t_mins, t_maxs, linewidth=3, label='TX')
-    axes[3].set_yticks(y)
-    axes[3].set_yticklabels(ok['section_n'].astype(str))
-    axes[3].set_title(f'czstack z-ranges ({coord_sys})')
-    axes[3].set_xlabel('z')
-    axes[3].set_ylabel('section')
-    axes[3].legend(fontsize=8)
-
-    plt.suptitle(f"QC summary: img_key_type={img_key_type}, channel={channel}", y=1.02, fontsize=11)
-    plt.tight_layout()
-    plt.show()
-    return df
+    return results

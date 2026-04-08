@@ -1,5 +1,6 @@
 
 from spatialdata.transformations import Scale, Translation, Sequence, Identity, set_transformation, get_transformation
+from spatialdata.models import Image3DModel
 import spatialdata as sd
 import xarray as xr
 import numpy as np
@@ -14,6 +15,48 @@ def _is_multiscale(element):
         and callable(element.keys)
         and not isinstance(element, GeoDataFrame)
     )
+
+def rename_chans(sdata, el, channel_name_map=None):
+    if channel_name_map is None:
+        channel_name_map = {
+            'DAPI': 'dapi',
+            'ATP1A1/CD45/E-Cadherin': 'boundary',
+            '18S': 'rna',
+            'AlphaSMA/Vimentin': 'protein'
+        }
+
+    def _rename_channel_coord(element_obj):
+        if not hasattr(element_obj, 'coords'):
+            return element_obj
+        if 'c' not in element_obj.coords:
+            return element_obj
+
+        old_names = [str(ch) for ch in element_obj.coords['c'].values]
+        new_names = [channel_name_map.get(ch, ch) for ch in old_names]
+
+        if old_names == new_names:
+            return element_obj
+
+        if len(set(new_names)) != len(new_names):
+            raise ValueError(
+                f"Renaming channels for '{el}' would create duplicate names: {new_names}"
+            )
+
+        return element_obj.assign_coords(c=new_names)
+
+    element = sdata[el]
+
+    if _is_multiscale(element):
+        for scale_key in list(element.keys()):
+            scale_obj = element[scale_key]
+            if hasattr(scale_obj, 'image'):
+                scale_obj['image'] = _rename_channel_coord(scale_obj['image'])
+            else:
+                element[scale_key] = _rename_channel_coord(scale_obj)
+    else:
+        sdata[el] = _rename_channel_coord(element)
+
+    return sdata
 
 def get_microns_scales(sdata, element_name):
     el = sdata[element_name]

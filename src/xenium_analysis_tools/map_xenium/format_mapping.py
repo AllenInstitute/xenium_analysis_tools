@@ -2,7 +2,134 @@ import pandas as pd
 import numpy as np
 import seaborn as sns
 import matplotlib.colors as mcolors
+
 ######## Functions for adding mapping info to sdata
+def add_mapped_cells_cols(adata, mapped_adata,
+                          adata_cell_id_col='cell_id',
+                          mapped_cell_id_col='cell_id',
+                          verbose=False):
+    import scanpy as sc
+    if isinstance(mapped_adata, str) or isinstance(mapped_adata, Path):
+        mapped_adata = sc.read(mapped_adata)
+
+    # Work on a copy of obs so we don't mutate the caller's object
+    mapped_obs = mapped_adata.obs.copy()
+
+    # Identify CDM_ columns, then strip the prefix
+    cdm_cols = mapped_obs.columns[mapped_obs.columns.str.startswith('CDM_')]
+    col_rename = {c: c.replace('CDM_', '') for c in cdm_cols}
+    mapped_obs = mapped_obs.rename(columns=col_rename)
+
+    # Derive broad_class / class_id before merging
+    if 'class_name' in mapped_obs.columns:
+        mapped_obs['class_id'] = (
+            mapped_obs['class_name'].str.split(' ').str[0].astype(int)
+        )
+        conditions = [
+            mapped_obs['class_name'].str.contains('GABA'),
+            mapped_obs['class_name'].str.contains('Glut'),
+            mapped_obs['class_id'] >= 29,
+        ]
+        mapped_obs['broad_class_name'] = np.select(
+            conditions, ['GABA', 'Glut', 'NN'], default='Other'
+        )
+
+    # Columns to bring over (only those not already in adata.obs)
+    derived_cols = [c for c in ['class_id', 'broad_class_name'] if c in mapped_obs.columns]
+    renamed_cols = list(col_rename.values())
+    mapping_obs_cols = [c for c in renamed_cols + derived_cols
+                        if c not in adata.obs.columns]
+
+    if not mapping_obs_cols:
+        if verbose:
+            print("No new obs columns to add from mapped data")
+        return adata
+
+    if verbose:
+        print(f"Adding {len(mapping_obs_cols)} obs columns: {mapping_obs_cols}")
+
+    # ── Determine join keys ──────────────────────────────────────────────────
+    has_mapped_id  = mapped_cell_id_col in mapped_obs.columns
+    has_adata_id   = adata_cell_id_col  in adata.obs.columns
+    has_section    = 'section' in mapped_obs.columns and 'section' in adata.obs.columns
+    multi_section  = has_section and mapped_obs['section'].nunique() > 1
+
+    if has_mapped_id and has_adata_id:
+        if multi_section:
+            join_keys_right = [mapped_cell_id_col, 'section']
+            join_keys_left  = [adata_cell_id_col,  'section']
+        else:
+            join_keys_right = [mapped_cell_id_col]
+            join_keys_left  = [adata_cell_id_col]
+
+        # Build right-side DataFrame with only the columns we need
+        right_cols = list(dict.fromkeys(mapping_obs_cols + join_keys_right))  # preserve order, no dupes
+        right = (
+            mapped_obs[right_cols]
+            .drop_duplicates(subset=join_keys_right)
+            .copy()
+        )
+
+        # Align section dtype to prevent silent type-mismatch misses
+        if 'section' in join_keys_right:
+            right['section'] = right['section'].astype(adata.obs['section'].dtype)
+
+        # Rename right join key to match left if they differ
+        if mapped_cell_id_col != adata_cell_id_col:
+            right = right.rename(columns={mapped_cell_id_col: adata_cell_id_col})
+            join_keys_right = [adata_cell_id_col if k == mapped_cell_id_col else k
+                               for k in join_keys_right]
+
+        orig_index = adata.obs.index
+        merged = adata.obs.merge(right, left_on=join_keys_left,
+                                 right_on=join_keys_right, how='left')
+        merged.index = orig_index
+        adata.obs = merged
+
+        n_matched = merged[mapping_obs_cols[0]].notna().sum()
+        if verbose:
+            print(f"  Joined on {join_keys_left}: "
+                  f"{n_matched} / {len(adata.obs)} cells matched")
+
+        # Diagnostic: show sample values to help debug zero-match cases
+        if n_matched == 0:
+            print("  WARNING: 0 cells matched. Sample join-key values:")
+            print(f"    adata.obs['{adata_cell_id_col}'].head()  = "
+                  f"{adata.obs[adata_cell_id_col].head().tolist()}")
+            print(f"    right['{adata_cell_id_col}'].head()      = "
+                  f"{right[adata_cell_id_col].head().tolist()}")
+            if 'section' in join_keys_left:
+                print(f"    adata 'section' dtype  : {adata.obs['section'].dtype}")
+                print(f"    mapped 'section' dtype : {mapped_obs['section'].dtype}")
+
+    else:
+        # Index-based fallback
+        if verbose:
+            print("  Falling back to index-based merge")
+        orig_index = adata.obs.index
+        merged = adata.obs.merge(
+            mapped_obs[mapping_obs_cols],
+            left_index=True, right_index=True, how='left',
+        )
+        merged.index = orig_index
+        adata.obs = merged
+
+    # ── var columns (index-based) ────────────────────────────────────────────
+    mapping_vars_cols = [c for c in mapped_adata.var.columns
+                         if c not in adata.var.columns]
+    if not mapping_vars_cols:
+        if verbose:
+            print("No new var columns to add from mapped data")
+    else:
+        if verbose:
+            print(f"Adding {len(mapping_vars_cols)} var columns: {mapping_vars_cols}")
+        adata.var = adata.var.merge(
+            mapped_adata.var[mapping_vars_cols],
+            left_index=True, right_index=True, how='left',
+        )
+
+    return adata
+
 def map_to_broad_subclass_name(subclass_name, patterns):
     if pd.isna(subclass_name):
         return 'Other'
