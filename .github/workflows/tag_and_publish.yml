@@ -48,18 +48,6 @@ jobs:
           new_interrogate_badge="interrogate-$interrogate_val%25-yellow"
         fi
         sed -i "s/$interrogate_badge/$new_interrogate_badge/g" README.md
-    - name: Get interrogate values and Update README.md
-      run: |
-        interrogate_val=$(interrogate . | grep -o 'actual: [0-9]*\.[0-9]*' | awk '{print $2}')
-        interrogate_badge=$(grep '^\!\[Interrogate\]' README.md | sed -n 's/.*\(interrogate-[^)]*\).*/\1/p')
-        if (( $(echo "$interrogate_val >= 90.00" | bc -l) )); then
-            new_interrogate_badge="interrogate-$interrogate_val%25-brightgreen"
-        elif (( $(echo "$interrogate_val < 80.00" | bc -l) )); then
-            new_interrogate_badge="interrogate-$interrogate_val%25-red"
-        else
-            new_interrogate_badge="interrogate-$interrogate_val%25-yellow"
-        fi
-        sed -i "s/$interrogate_badge/$new_interrogate_badge/g" README.md
     - name: Get Coverage values and Update README.md
       run: |
         coverage run -m unittest discover
