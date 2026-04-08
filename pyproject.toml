@@ -36,14 +36,14 @@ napari = [
 
 [dependency-groups]
 dev = [
-    'black',
-    'coverage',
-    'flake8',
-    'interrogate>=1.7.1',
-    'isort',
-    'Sphinx',
-    'furo'
-]
+      "black",
+      "coverage",
+      "flake8",
+      "interrogate==1.7.0",
+      "isort",
+      "Sphinx",
+      "furo",
+    ]
 
 [tool.setuptools.packages.find]
 where = ["src"]
