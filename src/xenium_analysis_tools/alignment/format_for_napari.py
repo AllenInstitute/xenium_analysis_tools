@@ -207,12 +207,11 @@ def filter_transcripts(sdata,
         if return_only:
             tx_els[tx_el] = tx
         else:
-            sdata.points[tx_el] = tx  
-    
+            sdata.points[tx_el] = tx
+
     if return_only:
         return tx_els
-    else:
-        return sdata
+    return sdata
 
 def is_dask(df):
     return isinstance(df, dd.DataFrame)
@@ -1115,5 +1114,397 @@ def recolor_tx_layer(viewer, el_name, sdata, color_col, colors_dict=None, cmap='
         **tx_layer.properties,
         color_col: tx_fns,
     }
-    tx_layer.face_color_cycle = tx_colors 
-    tx_layer.face_color = color_col   
+    tx_layer.face_color_cycle = tx_colors
+    tx_layer.face_color = color_col
+
+
+def add_cell_matcher(
+    viewer,
+    gcamp_layer_prefix='gcamp_labels',
+    xenium_layer_prefix='cell_labels',
+    output_path='cell_matches.csv',
+    coord_system='czstack_microns',
+):
+    """
+    Add an interactive cell-matching dock widget to an existing napari viewer.
+
+    Hover over a cell in any layer and press a key to record its label ID.
+    When both a GCaMP and a Xenium cell are selected, press Enter to save the
+    pair. Matches are appended to a CSV after every confirmation.
+
+    Controls
+    --------
+    G      — record the GCaMP label (gcamp_labels-*) under the cursor
+    X      — record the Xenium cell label (cell_labels-*) under the cursor
+    Enter  — confirm the pending pair and save to CSV
+    Escape — clear the current pending selection
+
+    Parameters
+    ----------
+    viewer : napari.Viewer
+    gcamp_layer_prefix : str
+        Prefix used to find the GCaMP labels layer (e.g. 'gcamp_labels').
+    xenium_layer_prefix : str
+        Prefix used to find the Xenium cell labels layer (e.g. 'cell_labels').
+    output_path : str or Path
+        CSV file to write/append matches to.  Created on first save; existing
+        rows are loaded on startup so you can resume across sessions.
+
+    Returns
+    -------
+    widget : QWidget
+        The dock widget (already added to the viewer).
+    matches : list of (int, int)
+        Live list of confirmed (gcamp_id, xenium_cell_id) pairs.
+    """
+    from pathlib import Path as _Path
+    import pandas as _pd
+    from qtpy.QtWidgets import (
+        QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+        QPushButton, QTableWidget, QTableWidgetItem, QHeaderView, QShortcut,
+        QAbstractItemView,
+    )
+    from qtpy.QtGui import QKeySequence
+    from qtpy.QtCore import Qt
+
+    output_path = _Path(output_path)
+
+    # Each match is (gcamp_id, xenium_cell_id, xenium_layer,
+    #                gcamp_z, gcamp_y, gcamp_x, xenium_z, xenium_y, xenium_x)
+    _COORD_COLS = ['gcamp_z', 'gcamp_y', 'gcamp_x', 'xenium_z', 'xenium_y', 'xenium_x']
+    if output_path.exists():
+        _existing = _pd.read_csv(output_path)
+        for col in _COORD_COLS:
+            if col not in _existing.columns:
+                _existing[col] = None
+        def _maybe_float(v):
+            try:
+                return None if _pd.isna(v) else float(v)
+            except Exception:
+                return None
+        matches = [
+            (int(r.gcamp_id), int(r.xenium_cell_id), str(r.xenium_layer),
+             _maybe_float(r.gcamp_z), _maybe_float(r.gcamp_y), _maybe_float(r.gcamp_x),
+             _maybe_float(r.xenium_z), _maybe_float(r.xenium_y), _maybe_float(r.xenium_x))
+            for r in _existing.itertuples(index=False)
+        ]
+    else:
+        matches = []
+
+    state = {
+        'gcamp_id': None,
+        'gcamp_pos': None,   # (z, y, x) world coords at pick time
+        'xenium_hits': [],   # list of (xenium_cell_id, xenium_layer) — usually 1, >1 if sections overlap
+        'xenium_pos': None,  # (z, y, x) world coords at pick time
+        'armed': None,       # None | 'gcamp' | 'xenium'
+    }
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    import napari as _napari
+
+    def _gcamp_label_at_pos(pos):
+        for layer in viewer.layers:
+            if isinstance(layer, _napari.layers.Labels) and layer.name.startswith(gcamp_layer_prefix):
+                val = layer.get_value(pos, world=True)
+                return val, None
+        return None, f"No Labels layer with prefix '{gcamp_layer_prefix}' found."
+
+    def _xenium_label_at_pos(pos):
+        """Returns (hits, warning) where hits is a list of (cell_id, layer_name).
+        If multiple layers overlap, all are returned with a warning string."""
+        hits = []
+        found_any = False
+        for layer in viewer.layers:
+            if isinstance(layer, _napari.layers.Labels) and layer.name.startswith(xenium_layer_prefix):
+                found_any = True
+                val = layer.get_value(pos, world=True)
+                if val is not None and val != 0:
+                    hits.append((int(val), layer.name))
+        if not found_any:
+            return [], f"No Labels layer with prefix '{xenium_layer_prefix}' found."
+        if not hits:
+            return [], "Clicked background in all Xenium layers. Try again."
+        if len(hits) > 1:
+            names = ', '.join(f"{n} (id={v})" for v, n in hits)
+            return hits, f"Warning: overlapping sections — will save {len(hits)} rows: {names}"
+        return hits, None
+
+    # ------------------------------------------------------------------
+    # UI
+    # ------------------------------------------------------------------
+    widget = QWidget()
+    layout = QVBoxLayout()
+    widget.setLayout(layout)
+
+    pick_row = QHBoxLayout()
+    pick_gcamp_btn = QPushButton("Pick GCaMP cell")
+    pick_xenium_btn = QPushButton("Pick Xenium cell")
+    pick_row.addWidget(pick_gcamp_btn)
+    pick_row.addWidget(pick_xenium_btn)
+    layout.addLayout(pick_row)
+
+    instructions = QLabel(
+        "Click a pick button, then click the cell in the viewer.<br>"
+        "<b>Enter</b> = confirm pair &nbsp;&nbsp; <b>Esc</b> = cancel pick / clear"
+    )
+    instructions.setWordWrap(True)
+    layout.addWidget(instructions)
+
+    pending_label = QLabel("Pending: GCaMP=—  |  Xenium=—")
+    pending_label.setStyleSheet("font-weight: bold; font-size: 13px; color: #888;")
+    layout.addWidget(pending_label)
+
+    dupe_label = QLabel("")
+    dupe_label.setStyleSheet("font-size: 12px; color: #3af; font-style: italic;")
+    dupe_label.setWordWrap(True)
+    layout.addWidget(dupe_label)
+
+    table = QTableWidget(0, 3)
+    table.setHorizontalHeaderLabels(['GCaMP ID', 'Xenium Cell ID', 'Xenium Layer'])
+    table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+    table.setEditTriggers(QTableWidget.NoEditTriggers)
+    table.setSelectionBehavior(QAbstractItemView.SelectRows)
+    table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+    table.setMaximumHeight(220)
+    layout.addWidget(table)
+
+    btn_row = QHBoxLayout()
+    confirm_btn    = QPushButton("Confirm  (Enter)")
+    clear_btn      = QPushButton("Clear  (Esc)")
+    undo_btn       = QPushButton("Undo last")
+    delete_sel_btn = QPushButton("Delete selected rows")
+    for b in (confirm_btn, clear_btn, undo_btn, delete_sel_btn):
+        btn_row.addWidget(b)
+    layout.addLayout(btn_row)
+
+    status = QLabel("Click 'Start Matching' to begin.")
+    status.setWordWrap(True)
+    layout.addWidget(status)
+
+    count_label = QLabel()
+    layout.addWidget(count_label)
+
+    # ------------------------------------------------------------------
+    # State updates
+    # ------------------------------------------------------------------
+    _ARMED_GCAMP_STYLE  = "font-size: 12px; padding: 5px; background: #1a6a8a; color: white; font-weight: bold;"
+    _ARMED_XENIUM_STYLE = "font-size: 12px; padding: 5px; background: #6a3a8a; color: white; font-weight: bold;"
+    _UNARMED_STYLE      = "font-size: 12px; padding: 5px;"
+
+    def _refresh_armed():
+        armed = state['armed']
+        pick_gcamp_btn.setStyleSheet(_ARMED_GCAMP_STYLE  if armed == 'gcamp'  else _UNARMED_STYLE)
+        pick_xenium_btn.setStyleSheet(_ARMED_XENIUM_STYLE if armed == 'xenium' else _UNARMED_STYLE)
+
+    def _refresh_table():
+        table.setSortingEnabled(False)
+        table.setRowCount(len(matches))
+        for row, m in enumerate(matches):
+            g, x, lyr = m[0], m[1], m[2]
+            item_g = QTableWidgetItem(str(g))
+            item_g.setData(Qt.UserRole, row)  # original index survives sort
+            table.setItem(row, 0, item_g)
+            table.setItem(row, 1, QTableWidgetItem(str(x)))
+            table.setItem(row, 2, QTableWidgetItem(str(lyr)))
+        table.setSortingEnabled(True)
+        table.scrollToBottom()
+        count_label.setText(f"{len(matches)} pairs saved → {output_path}")
+
+    def _refresh_pending():
+        g    = state['gcamp_id']
+        hits = state['xenium_hits']
+        gstr = str(g) if g is not None else "—"
+        if not hits:
+            xstr = "—"
+        elif len(hits) == 1:
+            xstr = f"{hits[0][0]} ({hits[0][1]})"
+        else:
+            xstr = f"{', '.join(str(v) for v, _ in hits)} ({len(hits)} layers)"
+        if g is None and not hits:
+            pending_label.setText("Pending: GCaMP=—  |  Xenium=—")
+            pending_label.setStyleSheet("font-weight: bold; font-size: 13px; color: #888;")
+        elif g is not None and hits:
+            pending_label.setText(f"Pending: GCaMP={gstr}  |  Xenium={xstr}  ← Enter")
+            pending_label.setStyleSheet("font-weight: bold; font-size: 13px; color: #2ecc71;")
+        else:
+            pending_label.setText(f"Pending: GCaMP={gstr}  |  Xenium={xstr}")
+            pending_label.setStyleSheet("font-weight: bold; font-size: 13px; color: #e67e22;")
+
+    def _save():
+        df = _pd.DataFrame(matches, columns=[
+            'gcamp_id', 'xenium_cell_id', 'xenium_layer',
+            'gcamp_z', 'gcamp_y', 'gcamp_x',
+            'xenium_z', 'xenium_y', 'xenium_x',
+        ])
+        df['coord_system'] = coord_system
+        df.to_csv(output_path, index=False)
+
+    def _arm(cell_type):
+        """Toggle armed state for a cell type; clicking again cancels."""
+        if state['armed'] == cell_type:
+            state['armed'] = None
+            status.setText("Pick cancelled.")
+        else:
+            state['armed'] = cell_type
+            label = 'GCaMP' if cell_type == 'gcamp' else 'Xenium'
+            status.setText(f"Armed: click on a {label} cell in the viewer.")
+        _refresh_armed()
+
+    def _check_dupes():
+        """Update dupe_label based on current pending picks vs existing matches."""
+        existing_gcamps  = {m[0] for m in matches}
+        existing_xeniums = {m[1] for m in matches}
+        msgs = []
+        g = state['gcamp_id']
+        if g is not None and g in existing_gcamps:
+            msgs.append(f"GCaMP {g} already in table")
+        for x, _ in state['xenium_hits']:
+            if x in existing_xeniums:
+                msgs.append(f"Xenium {x} already in table")
+        dupe_label.setText("  ⚠ " + " | ".join(msgs) if msgs else "")
+
+    def _confirm():
+        g    = state['gcamp_id']
+        hits = state['xenium_hits']
+        if g is None or not hits:
+            status.setText("Need both GCaMP and Xenium IDs before confirming.")
+            return
+        gp = state['gcamp_pos'] or (None, None, None)
+        xp = state['xenium_pos'] or (None, None, None)
+        for x, lyr in hits:
+            matches.append((int(g), int(x), str(lyr),
+                            gp[0], gp[1], gp[2],
+                            xp[0], xp[1], xp[2]))
+        _save()
+        _refresh_table()
+        state['gcamp_id'] = None
+        state['gcamp_pos'] = None
+        state['xenium_hits'] = []
+        state['xenium_pos'] = None
+        dupe_label.setText("")
+        _refresh_pending()
+        saved_str = ", ".join(f"Xenium {x}" for x, _ in hits)
+        status.setText(f"Saved: GCaMP {g}  ↔  {saved_str}")
+
+    def _clear():
+        state['gcamp_id'] = None
+        state['gcamp_pos'] = None
+        state['xenium_hits'] = []
+        state['xenium_pos'] = None
+        state['armed'] = None
+        dupe_label.setText("")
+        _refresh_armed()
+        _refresh_pending()
+        status.setText("Cleared.")
+
+    def _undo():
+        if not matches:
+            status.setText("Nothing to undo.")
+            return
+        removed = matches.pop()
+        _save()
+        _refresh_table()
+        status.setText(f"Undid last row: GCaMP {removed[0]}  ↔  Xenium {removed[1]}  ({removed[2]})")
+
+    def _delete_selected():
+        selected_rows = {idx.row() for idx in table.selectedIndexes()}
+        if not selected_rows:
+            status.setText("No rows selected.")
+            return
+        orig_indices = set()
+        for row in selected_rows:
+            item = table.item(row, 0)
+            if item is not None:
+                orig_indices.add(item.data(Qt.UserRole))
+        for idx in sorted(orig_indices, reverse=True):
+            matches.pop(idx)
+        _save()
+        _refresh_table()
+        status.setText(f"Deleted {len(orig_indices)} row(s).")
+
+    def _navigate_to(row, col):
+        item = table.item(row, 0)
+        if item is None:
+            return
+        orig_idx = item.data(Qt.UserRole)
+        if orig_idx is None or orig_idx >= len(matches):
+            return
+        m = matches[orig_idx]
+        # m[3:6] = gcamp z,y,x ; m[6:9] = xenium z,y,x
+        pos = m[3:6] if col == 0 else m[6:9]
+        if any(p is None for p in pos):
+            status.setText("No coordinates stored for this row (loaded from older CSV).")
+            return
+        viewer.camera.center = pos
+        status.setText(f"Navigated to {'GCaMP' if col == 0 else 'Xenium'} cell position.")
+
+    # Canvas click handler — fires on every left-click while armed.
+    # napari mouse_drag_callbacks must be generator functions.
+    def _on_canvas_click(viewer_obj, event):
+        if event.button == 1 and state['armed'] is not None:
+            armed = state['armed']
+            pos = viewer_obj.cursor.position
+            state['armed'] = None
+            _refresh_armed()
+            if armed == 'gcamp':
+                val, err = _gcamp_label_at_pos(pos)
+                if err:
+                    status.setText(err)
+                elif val is None or val == 0:
+                    status.setText("Clicked background in GCaMP layer. Try again.")
+                else:
+                    state['gcamp_id'] = int(val)
+                    state['gcamp_pos'] = tuple(pos)
+                    _refresh_pending()
+                    _check_dupes()
+                    status.setText(f"GCaMP cell {val} picked.")
+            else:
+                hits, warn = _xenium_label_at_pos(pos)
+                if not hits:
+                    status.setText(warn)
+                else:
+                    state['xenium_hits'] = hits
+                    state['xenium_pos'] = tuple(pos)
+                    _refresh_pending()
+                    _check_dupes()
+                    if warn:
+                        status.setText(warn)
+                    elif len(hits) == 1:
+                        status.setText(f"Xenium cell {hits[0][0]} picked from {hits[0][1]}.")
+                    else:
+                        status.setText(f"{len(hits)} overlapping Xenium cells picked — will save {len(hits)} rows on confirm.")
+        yield
+
+    viewer.mouse_drag_callbacks.append(_on_canvas_click)
+
+    table.cellDoubleClicked.connect(_navigate_to)
+
+    pick_gcamp_btn.clicked.connect(lambda: _arm('gcamp'))
+    pick_xenium_btn.clicked.connect(lambda: _arm('xenium'))
+    confirm_btn.clicked.connect(_confirm)
+    clear_btn.clicked.connect(_clear)
+    undo_btn.clicked.connect(_undo)
+    delete_sel_btn.clicked.connect(_delete_selected)
+
+    _refresh_table()
+    _refresh_pending()
+    _refresh_armed()
+
+    # Return and Escape use application-wide shortcuts so they fire
+    # regardless of whether napari canvas or the dock widget has focus.
+    _sc_confirm = QShortcut(QKeySequence(Qt.Key_Return), widget)
+    _sc_confirm.setContext(Qt.ApplicationShortcut)
+    _sc_confirm.activated.connect(_confirm)
+
+    _sc_clear = QShortcut(QKeySequence(Qt.Key_Escape), widget)
+    _sc_clear.setContext(Qt.ApplicationShortcut)
+    _sc_clear.activated.connect(_clear)
+
+    # ------------------------------------------------------------------
+    # Dock the widget
+    # ------------------------------------------------------------------
+    viewer.window.add_dock_widget(widget, name='Cell Matcher', area='right')
+
+    return widget, matches
