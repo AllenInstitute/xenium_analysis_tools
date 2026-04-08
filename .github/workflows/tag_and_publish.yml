@@ -50,16 +50,25 @@ jobs:
         sed -i "s/$interrogate_badge/$new_interrogate_badge/g" README.md
     - name: Get Coverage values and Update README.md
       run: |
+        set -euo pipefail
+    
         coverage run -m unittest discover
         coverage_val=$(coverage report | grep "^TOTAL" | grep -o '[0-9]\+%' | grep -o '[0-9]\+')
-        coverage_badge=$(grep '^\!\[Coverage\]' README.md | sed -n 's/.*\(coverage-[^)]*\).*/\1/p')
-        if (( $(echo "$coverage_val >= 90.00" | bc -l) )); then 
-            new_coverage_badge="coverage-$coverage_val%25-brightgreen"
-        elif (( $(echo "$coverage_val < 80.00" | bc -l) )); then
-            new_coverage_badge="coverage-$coverage_val%25-red"
-        else
-            new_coverage_badge="coverage-$coverage_val%25-yellow"
+    
+        coverage_badge=$(grep '^\!\[Coverage\]' README.md | sed -n 's/.*\(coverage-[^)]*\).*/\1/p' || true)
+        if [[ -z "${coverage_badge:-}" ]]; then
+          echo "Coverage badge not found in README.md; skipping."
+          exit 0
         fi
+    
+        if (( $(echo "$coverage_val >= 90.00" | bc -l) )); then
+          new_coverage_badge="coverage-$coverage_val%25-brightgreen"
+        elif (( $(echo "$coverage_val < 80.00" | bc -l) )); then
+          new_coverage_badge="coverage-$coverage_val%25-red"
+        else
+          new_coverage_badge="coverage-$coverage_val%25-yellow"
+        fi
+    
         sed -i "s/$coverage_badge/$new_coverage_badge/g" README.md
     - name: Commit changes
       uses: EndBug/add-and-commit@v9
