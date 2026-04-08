@@ -39,7 +39,7 @@ dev = [
     'black',
     'coverage',
     'flake8',
-    'interrogate>=1.7.0',
+    'interrogate==1.7.0',
     'isort',
     'Sphinx',
     'furo'
