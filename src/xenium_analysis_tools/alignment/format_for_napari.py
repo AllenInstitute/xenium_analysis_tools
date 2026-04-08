@@ -1197,17 +1197,30 @@ def add_cell_matcher(
     # ------------------------------------------------------------------
     import napari as _napari
 
+    def _label_centroid_world(layer, label_val):
+        import numpy as _np
+        data = layer.data
+        if hasattr(data, 'compute'):
+            data = data.compute()
+        data = _np.asarray(data)
+        coords = _np.argwhere(data == int(label_val))
+        if len(coords) == 0:
+            return None
+        centroid_idx = coords.mean(axis=0)
+        return tuple(layer.data_to_world(centroid_idx))
+
     def _gcamp_label_at_pos(pos):
         for layer in viewer.layers:
             if isinstance(layer, _napari.layers.Labels) and layer.name.startswith(gcamp_layer_prefix):
                 val = layer.get_value(pos, world=True)
-                return val, None
-        return None, f"No Labels layer with prefix '{gcamp_layer_prefix}' found."
+                return val, layer, None
+        return None, None, f"No Labels layer with prefix '{gcamp_layer_prefix}' found."
 
     def _xenium_label_at_pos(pos):
-        """Returns (hits, warning) where hits is a list of (cell_id, layer_name).
+        """Returns (hits, hit_layers, warning) where hits is a list of (cell_id, layer_name).
         If multiple layers overlap, all are returned with a warning string."""
         hits = []
+        hit_layers = []
         found_any = False
         for layer in viewer.layers:
             if isinstance(layer, _napari.layers.Labels) and layer.name.startswith(xenium_layer_prefix):
@@ -1215,14 +1228,15 @@ def add_cell_matcher(
                 val = layer.get_value(pos, world=True)
                 if val is not None and val != 0:
                     hits.append((int(val), layer.name))
+                    hit_layers.append(layer)
         if not found_any:
-            return [], f"No Labels layer with prefix '{xenium_layer_prefix}' found."
+            return [], [], f"No Labels layer with prefix '{xenium_layer_prefix}' found."
         if not hits:
-            return [], "Clicked background in all Xenium layers. Try again."
+            return [], [], "Clicked background in all Xenium layers. Try again."
         if len(hits) > 1:
             names = ', '.join(f"{n} (id={v})" for v, n in hits)
-            return hits, f"Warning: overlapping sections — will save {len(hits)} rows: {names}"
-        return hits, None
+            return hits, hit_layers, f"Warning: overlapping sections — will save {len(hits)} rows: {names}"
+        return hits, hit_layers, None
 
     # ------------------------------------------------------------------
     # UI
@@ -1272,7 +1286,7 @@ def add_cell_matcher(
         btn_row.addWidget(b)
     layout.addLayout(btn_row)
 
-    status = QLabel("Click 'Start Matching' to begin.")
+    status = QLabel("")
     status.setWordWrap(True)
     layout.addWidget(status)
 
@@ -1430,8 +1444,33 @@ def add_cell_matcher(
         if any(p is None for p in pos):
             status.setText("No coordinates stored for this row (loaded from older CSV).")
             return
-        viewer.camera.center = pos
-        status.setText(f"Navigated to {'GCaMP' if col == 0 else 'Xenium'} cell position.")
+        z, y, x = pos
+        # Move z-slider to the cell's plane
+        viewer.dims.set_point(0, z)
+        viewer.camera.center = (z, y, x)
+        label = 'GCaMP' if col == 0 else 'Xenium'
+        status.setText(f"Navigated to {label} cell — z={z:.2f}, y={y:.2f}, x={x:.2f}")
+
+    def _show_row_coords():
+        selected = table.selectedItems()
+        if not selected:
+            return
+        row = selected[0].row()
+        item = table.item(row, 0)
+        if item is None:
+            return
+        orig_idx = item.data(Qt.UserRole)
+        if orig_idx is None or orig_idx >= len(matches):
+            return
+        m = matches[orig_idx]
+        gz, gy, gx = m[3], m[4], m[5]
+        xz, xy, xx = m[6], m[7], m[8]
+        def _fmt(v):
+            return f"{v:.2f}" if v is not None else "?"
+        status.setText(
+            f"GCaMP {m[0]}: z={_fmt(gz)}, y={_fmt(gy)}, x={_fmt(gx)}  |  "
+            f"Xenium {m[1]}: z={_fmt(xz)}, y={_fmt(xy)}, x={_fmt(xx)}"
+        )
 
     # Canvas click handler — fires on every left-click while armed.
     # napari mouse_drag_callbacks must be generator functions.
@@ -1442,24 +1481,25 @@ def add_cell_matcher(
             state['armed'] = None
             _refresh_armed()
             if armed == 'gcamp':
-                val, err = _gcamp_label_at_pos(pos)
+                val, layer, err = _gcamp_label_at_pos(pos)
                 if err:
                     status.setText(err)
                 elif val is None or val == 0:
                     status.setText("Clicked background in GCaMP layer. Try again.")
                 else:
                     state['gcamp_id'] = int(val)
-                    state['gcamp_pos'] = tuple(pos)
+                    state['gcamp_pos'] = _label_centroid_world(layer, val)
                     _refresh_pending()
                     _check_dupes()
                     status.setText(f"GCaMP cell {val} picked.")
             else:
-                hits, warn = _xenium_label_at_pos(pos)
+                hits, hit_layers, warn = _xenium_label_at_pos(pos)
                 if not hits:
                     status.setText(warn)
                 else:
                     state['xenium_hits'] = hits
-                    state['xenium_pos'] = tuple(pos)
+                    # Use centroid of first hit layer for navigation (representative position)
+                    state['xenium_pos'] = _label_centroid_world(hit_layers[0], hits[0][0])
                     _refresh_pending()
                     _check_dupes()
                     if warn:
@@ -1472,7 +1512,31 @@ def add_cell_matcher(
 
     viewer.mouse_drag_callbacks.append(_on_canvas_click)
 
+    # # ------------------------------------------------------------------
+    # # Z-slider section boundary notifications
+    # # ------------------------------------------------------------------
+    # _z_section_state = {'last_sections': set()}
+
+    # def _on_z_change():
+    #     current_z = viewer.dims.point[0]
+    #     active_now = set()
+    #     for layer in viewer.layers:
+    #         if isinstance(layer, _napari.layers.Labels) and layer.name.startswith(xenium_layer_prefix):
+    #             zmin, zmax = layer.extent.world[0][0], layer.extent.world[1][0]
+    #             if zmin <= current_z <= zmax:
+    #                 active_now.add(layer.name)
+    #     entered = active_now - _z_section_state['last_sections']
+    #     exited  = _z_section_state['last_sections'] - active_now
+    #     if entered or exited:
+    #         msgs = [f"Entering {n}" for n in sorted(entered)] + \
+    #                [f"Leaving {n}"  for n in sorted(exited)]
+    #         status.setText("  |  ".join(msgs))
+    #     _z_section_state['last_sections'] = active_now
+
+    # viewer.dims.events.current_step.connect(_on_z_change)
+
     table.cellDoubleClicked.connect(_navigate_to)
+    table.itemSelectionChanged.connect(_show_row_coords)
 
     pick_gcamp_btn.clicked.connect(lambda: _arm('gcamp'))
     pick_xenium_btn.clicked.connect(lambda: _arm('xenium'))
