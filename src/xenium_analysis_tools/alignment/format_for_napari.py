@@ -12,6 +12,7 @@ from xenium_analysis_tools.alignment.align_sections import _get_lifted_element_t
 import dask.dataframe as dd
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+import napari
 
 def filter_labels(sdata, label_elements='cell_labels', table='table', key_col='cell_labels'):
     # Get all label elements that match the specified prefix
@@ -138,22 +139,43 @@ def get_fov_sdata(
     fov_data.points = filtered_points
     return fov_data
 
-def filter_transcripts(sdata, 
-                        genes_to_show='all', 
-                        filter_is_gene=False,
-                        filter_assigned_to_cell=False, 
+def filter_transcripts(sdata,
+                        genes_to_show='all',
+                        filter_is_gene=True,
+                        filter_assigned_to_cell=True,
                         min_qv=20,
-                        filter_transcripts_to_cells=False,
+                        filter_transcripts_to_cells=True,
                         sections=[],
                         add_prefix='',
+                        source_el=None,
                         return_only=False):
+    """
+    Filter transcript point elements in sdata.
+
+    If add_prefix is empty, the original elements are updated in place.
+    If add_prefix is set, the original elements are never modified; filtered
+    copies are written under f"{add_prefix}_{source_el_name}".
+
+    Parameters
+    ----------
+    source_el : str or None
+        When add_prefix is set, filter only this specific element instead of
+        iterating all transcripts* elements. The source element is never
+        modified. When None, all transcripts* elements are processed.
+    """
+    if add_prefix and source_el is not None:
+        candidates = [source_el]
+    else:
+        candidates = [k for k in sdata.points.keys() if k.startswith('transcripts')]
 
     if return_only:
         tx_els = {}
-    for tx_el in list(sdata.points.keys()):
-        print(f'Filtering {tx_el}...')
-        if not tx_el.startswith('transcripts'):
+
+    for tx_el in candidates:
+        if tx_el not in sdata.points:
+            print(f"Warning: {tx_el!r} not found in sdata.points, skipping")
             continue
+        print(f'Filtering {tx_el}...')
 
         tx = sdata.points[tx_el]
 
@@ -194,13 +216,13 @@ def filter_transcripts(sdata,
             cell_table = cell_table[cell_table.obs['section'] == s_n]
             tx = tx[tx['cell_id'].isin(cell_table.obs['cell_id'])]
 
-        print(f"{tx_el}: filters applied (lazy — will compute on render)")
-        if add_prefix:
-            tx_el = f"{add_prefix}_{tx_el}"
+        dest_el = f"{add_prefix}_{tx_el}" if add_prefix else tx_el
+        print(f"{tx_el} → {dest_el!r}: filters applied (lazy — will compute on render)")
+
         if return_only:
-            tx_els[tx_el] = tx
+            tx_els[dest_el] = tx
         else:
-            sdata.points[tx_el] = tx
+            sdata.points[dest_el] = tx
 
     if return_only:
         return tx_els
@@ -215,7 +237,7 @@ def get_sample_val(series):
         return series.head(1).iloc[0]
     return series.iloc[0]
 
-def filter_cells(sdata, cell_filters=[]):
+def filter_cells(sdata, el='table', cell_filters=[]):
     import operator as op_module
 
     # Map operator strings to functions
@@ -232,7 +254,7 @@ def filter_cells(sdata, cell_filters=[]):
     kept_cell_ids = None  # will be populated if cell filters are applied
 
     if cell_filters:
-        tbl = sdata.tables['table']
+        tbl = sdata.tables[el]
         obs = tbl.obs.copy()
         
         # Build combined boolean mask
@@ -262,8 +284,7 @@ def filter_cells(sdata, cell_filters=[]):
                     filtered_tbl.obs[region_key] = filtered_tbl.obs[region_key].cat.remove_unused_categories()
                 attrs['region'] = filtered_tbl.obs[region_key].unique().tolist()
         
-        sdata.tables['table'] = filtered_tbl
-        kept_cell_ids = set(filtered_tbl.obs[instance_key].astype(str).tolist())
+        sdata.tables[el] = filtered_tbl
         print(f"\n{mask.sum()} / {len(obs)} cells kept after all filters.")
     return sdata
 
@@ -877,6 +898,54 @@ def expand_for_napari(
 
     return plot_sdata
 
+def set_solid_label_color(sdata, table_key, color, col_name='label_color_group'):
+    table = sdata[table_key]
+    table.obs[col_name] = pd.Categorical(['all'] * table.n_obs)
+    table.uns[f'{col_name}_colors'] = np.array([color])
+
+def apply_layer_style(layer, layer_styles):
+    def _find_style(layer_name):
+        """Return params for the longest matching key, or None."""
+        matches = [k for k in layer_styles if k in layer_name]
+        return layer_styles[max(matches, key=len)] if matches else None
+    
+    params = _find_style(layer.name)
+    if params is None:
+        return
+
+    THUMBNAIL_PROPS = {'colormap', 'contrast_limits', 'blending', 'opacity'}
+    TYPE_GATES = {
+        'colormap':   napari.layers.Image,
+        'contour':    napari.layers.Labels,
+        'face_color': napari.layers.Points,
+    }
+    # Keys handled elsewhere — skip silently
+    SKIP = {'label_color', 'face_color_column'}
+
+    thumbnail_updates = {k: v for k, v in params.items()
+                         if k in THUMBNAIL_PROPS and k not in SKIP}
+    other_updates     = {k: v for k, v in params.items()
+                         if k not in THUMBNAIL_PROPS and k not in SKIP}
+
+    try:
+        for prop, val in thumbnail_updates.items():
+            gate = TYPE_GATES.get(prop)
+            if gate and not isinstance(layer, gate):
+                continue
+            if hasattr(layer, prop):
+                setattr(layer, prop, val)
+    except RuntimeError:
+        pass  # 3D layers fail _update_thumbnail; settings apply on render
+
+    for prop, val in other_updates.items():
+        gate = TYPE_GATES.get(prop)
+        if gate and not isinstance(layer, gate):
+            continue
+        if hasattr(layer, prop):
+            try:
+                setattr(layer, prop, val)
+            except Exception:
+                pass
 
 def add_napari_colormaps(
     sdata,
