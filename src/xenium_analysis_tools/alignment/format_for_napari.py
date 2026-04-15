@@ -12,7 +12,6 @@ from xenium_analysis_tools.alignment.align_sections import _get_lifted_element_t
 import dask.dataframe as dd
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
-import napari
 
 def filter_labels(sdata, label_elements='cell_labels', table='table', key_col='cell_labels'):
     # Get all label elements that match the specified prefix
@@ -904,6 +903,7 @@ def set_solid_label_color(sdata, table_key, color, col_name='label_color_group')
     table.uns[f'{col_name}_colors'] = np.array([color])
 
 def apply_layer_style(layer, layer_styles):
+    import napari
     def _find_style(layer_name):
         """Return params for the longest matching key, or None."""
         matches = [k for k in layer_styles if k in layer_name]
