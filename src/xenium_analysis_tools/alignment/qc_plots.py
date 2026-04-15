@@ -44,72 +44,87 @@ from xenium_analysis_tools.alignment.align_sections import (
     tilt_affines
 )
 
-def get_section_z_stats(affines_dict, landmarks_dict, czstack_shape_yx=(512, 512)):
+def get_section_z_stats(affines, landmarks, czstack_shape_yx=(512, 512),
+                        czstack_xy_um=1.0, czstack_z_um_per_plane=1.0):
+    """
+    Parameters
+    ----------
+    czstack_xy_um : float
+        Physical size of one czstack XY pixel in µm.  Used to convert the tilt
+        coefficients (czstack_z_planes / section_px) to a true geometric angle.
+    czstack_z_um_per_plane : float
+        Physical thickness of one czstack z-plane in µm.
+    """
     y_max, x_max = czstack_shape_yx
-    
-    # FOV corners in czstack pixels
-    fov_corners_czstack = np.array([
-        [0,     0,     0, 1],
-        [x_max, 0,     0, 1],
-        [0,     y_max, 0, 1],
-        [x_max, y_max, 0, 1],
-    ])  # columns: x, y, z, 1
+
+    # FOV corners in czstack (x, y) pixels
+    cz_corners = np.array([
+        [0,     0    ],
+        [x_max, 0    ],
+        [0,     y_max],
+        [x_max, y_max],
+    ], dtype=float)
 
     results = {}
-    for s_n, affines in affines_dict.items():
-        tilt = affines['section_to_czstack_full_affine']
-        if hasattr(landmarks_dict[s_n], 'compute'):
-            landmarks = landmarks_dict[s_n].compute()
-        else:
-            landmarks = landmarks_dict[s_n]
-        czstack_pts = landmarks[['czstack_x', 'czstack_y', 'czstack_z']].values
+    for s_n, section_affines in affines.items():
+        section_landmarks = landmarks[f'landmarks-{s_n}']
+        tilt = section_affines['section_to_czstack_full_affine']
+        czstack_pts = section_landmarks[['czstack_x', 'czstack_y', 'czstack_z']].values
         if isinstance(tilt, dict):
             tilt = Affine(
                 matrix=np.array(tilt['matrix']),
                 input_axes=tuple(tilt['input_axes']),
                 output_axes=tuple(tilt['output_axes'])
             )
-        mat = tilt.matrix  # input_axes=(x,y,z)
+        mat = tilt.matrix  # (4,4), input_axes=(x, y, z)
 
-        # Invert to go czstack -> section pixels, then forward to get z at FOV corners
-        inv_mat = np.linalg.inv(mat)
-        
-        # Map czstack FOV corners -> section pixels
-        section_corners = (inv_mat @ fov_corners_czstack.T).T  # (4, 4)
-        
-        # Map those section pixels -> czstack z via forward affine
-        fwd = np.zeros((4, 4))
-        fwd[:, 3] = 1
-        xi = list(tilt.input_axes).index('x')
-        yi = list(tilt.input_axes).index('y')
-        zi = list(tilt.input_axes).index('z')
-        for i in range(4):
-            fwd[i, xi] = section_corners[i, xi]
-            fwd[i, yi] = section_corners[i, yi]
-            fwd[i, zi] = 0
-        z_out = (mat @ fwd.T).T[:, list(tilt.output_axes).index('z')]
-        
+        # ── Tilt coefficients: z_czstack = a*x_xe + b*y_xe + c ───────────────
+        # mat[0,2] = mat[1,2] = 0 by construction, so XY mapping is z-independent.
+        a_z = mat[2, 0]   # czstack_z_planes / section_x_px
+        b_z = mat[2, 1]   # czstack_z_planes / section_y_px
+        c_z = mat[2, 3]   # z at section origin
+
+        # ── Invert only the 2×2 XY submatrix: czstack_px → section_px ────────
+        xy_sub = mat[:2, :2]
+        t_xy   = mat[:2, 3]
+        inv_xy = np.linalg.inv(xy_sub)
+
+        # Section (x, y) at each czstack FOV corner
+        xe_corners = (cz_corners - t_xy) @ inv_xy.T   # (4, 2)
+
+        # Z (czstack planes) at each FOV corner
+        z_corners = a_z * xe_corners[:, 0] + b_z * xe_corners[:, 1] + c_z
+
+        # Z at FOV centre
+        cz_center = np.array([[x_max / 2, y_max / 2]])
+        xe_center = (cz_center - t_xy) @ inv_xy.T     # (1, 2)
+        z_at_center = float(a_z * xe_center[0, 0] + b_z * xe_center[0, 1] + c_z)
+
         # Landmark-derived z centroid
         z_centroid_from_landmarks = float(np.mean(czstack_pts[:, 2]))
-        
-        # Z at the center of the FOV
-        center = np.array([[x_max/2, y_max/2, 0, 1]])
-        center_section = (inv_mat @ center.T).T
-        center_fwd = np.zeros((1, 4)); center_fwd[0, 3] = 1
-        center_fwd[0, xi] = center_section[0, xi]
-        center_fwd[0, yi] = center_section[0, yi]
-        center_fwd[0, zi] = 0
-        z_at_center = float((mat @ center_fwd.T).T[0, list(tilt.output_axes).index('z')])
-        
+
+        # ── True geometric tilt angle ─────────────────────────────────────────
+        # (a_z, b_z) are in czstack_z_planes / section_px — mixed units.
+        # Physical lateral gradient (µm of z-rise per µm of lateral travel):
+        #   section_px → czstack_px : scale_xy  (column-0 norm of XY submatrix)
+        #   czstack_z_planes → µm   : czstack_z_um_per_plane
+        #   czstack_px → µm         : czstack_xy_um
+        scale_xy = float(np.linalg.norm(mat[:2, 0]))   # czstack_px / section_px
+        tilt_gradient = (
+            np.sqrt(a_z ** 2 + b_z ** 2)
+            * czstack_z_um_per_plane
+            * scale_xy
+            / czstack_xy_um
+        )
+        tilt_deg = float(np.degrees(np.arctan(tilt_gradient)))
+
         results[s_n] = {
             'z_centroid_landmarks': z_centroid_from_landmarks,
             'z_at_fov_center':      z_at_center,
-            'z_min_in_fov':         float(z_out.min()),
-            'z_max_in_fov':         float(z_out.max()),
-            'z_span_in_fov':        float(z_out.max() - z_out.min()),
-            'tilt_deg':             float(np.degrees(np.arctan(
-                                        np.sqrt(mat[2,0]**2 + mat[2,1]**2) / abs(mat[2,2])
-                                    ))),
+            'z_min_in_fov':         float(z_corners.min()),
+            'z_max_in_fov':         float(z_corners.max()),
+            'z_span_in_fov':        float(z_corners.max() - z_corners.min()),
+            'tilt_deg':             tilt_deg,
         }
     return results
 
@@ -189,7 +204,7 @@ def print_z_stats_and_check_overlaps(results,
 
     return results
 
-def find_landmark_outliers(landmarks):
+def find_landmark_outliers(landmarks, czstack_xy_um=1.0, czstack_z_um_per_plane=1.0):
       if isinstance(landmarks, dd.DataFrame):
             lm = landmarks.compute()
       else:
@@ -215,14 +230,232 @@ def find_landmark_outliers(landmarks):
       tilt_all   = tilt_affines(xenium_pts_all, czstack_pts_all, flat_all)
       tilt_clean = tilt_affines(xenium_pts_clean, czstack_pts_clean, flat_clean)
 
-      print(f"\nWith all landmarks:     z_offset = {flat_all.matrix[2,3]:.3f}, "
-            f"tilt = {np.degrees(np.arctan(np.sqrt(tilt_all.matrix[2,0]**2 + tilt_all.matrix[2,1]**2))):.3f}°")
-      print(f"Without outliers:       z_offset = {flat_clean.matrix[2,3]:.3f}, "
-            f"tilt = {np.degrees(np.arctan(np.sqrt(tilt_clean.matrix[2,0]**2 + tilt_clean.matrix[2,1]**2))):.3f}°")
+      def _tilt_deg(tilt_mat, flat_mat):
+          """True geometric tilt angle in degrees, accounting for physical pixel scales."""
+          a_z, b_z   = tilt_mat.matrix[2, 0], tilt_mat.matrix[2, 1]
+          scale_xy   = float(np.linalg.norm(flat_mat.matrix[:2, 0]))  # czstack_px / section_px
+          grad = np.sqrt(a_z**2 + b_z**2) * czstack_z_um_per_plane * scale_xy / czstack_xy_um
+          return np.degrees(np.arctan(grad))
 
-      print(f"\nz_center separation from section 1:")
-      print(f"  With all landmarks:  {flat_all.matrix[2,3] - 67.4:.1f} planes")
-      print(f"  Without outliers:    {flat_clean.matrix[2,3] - 67.4:.1f} planes")
+      print(f"\nWith all landmarks:     z_offset = {flat_all.matrix[2,3]:.3f}, "
+            f"tilt = {_tilt_deg(tilt_all, flat_all):.3f}°")
+      print(f"Without outliers:       z_offset = {flat_clean.matrix[2,3]:.3f}, "
+            f"tilt = {_tilt_deg(tilt_clean, flat_clean):.3f}°")
+
+
+def diagnose_section_z_placement(results, sections_um=20.0, czstack_z_um_per_plane=1.0,
+                                  residual_threshold_um=5.0):
+    """
+    Identify sections likely mis-placed in z by fitting a robust linear trend
+    through z_at_fov_center vs section number and reporting residuals.
+
+    Uses Theil-Sen regression (median of all pairwise slopes), which is robust
+    to ~50% outliers — so close-pair placement errors don't bias the estimated
+    true section spacing.
+
+    Parameters
+    ----------
+    results : dict
+        Output of get_section_z_stats (must have run print_z_stats_and_check_overlaps
+        first so separation fields are populated).
+    sections_um : float
+        Expected physical section thickness in µm.
+    czstack_z_um_per_plane : float
+        µm per czstack z-plane.
+    residual_threshold_um : float
+        Sections with |residual| > this value are flagged for z correction.
+
+    Returns
+    -------
+    corrections : dict {section_n: delta_z_planes}
+        Add delta to every czstack_z landmark of that section to shift it onto
+        the fitted line.  Positive delta = section was placed too shallow.
+    """
+    from scipy.stats import theilslopes
+
+    sections = sorted(results.keys())
+    z_vals = np.array([results[s]['z_at_fov_center'] for s in sections])
+    s_arr  = np.array(sections, dtype=float)
+
+    # Robust linear fit — resistant to the close-pair errors
+    res       = theilslopes(z_vals, s_arr)
+    slope, intercept = res.slope, res.intercept
+    z_fitted  = slope * s_arr + intercept
+    residuals = z_vals - z_fitted          # positive = section placed too deep
+
+    expected_slope = sections_um / czstack_z_um_per_plane
+    threshold_pl   = residual_threshold_um / czstack_z_um_per_plane
+
+    print(f"Robust linear fit (Theil-Sen):  z = {slope:.2f} × section + {intercept:.2f}")
+    print(f"  fitted spacing:   {slope:.2f} pl/section = {slope * czstack_z_um_per_plane:.1f} µm/section")
+    print(f"  expected spacing: {expected_slope:.2f} pl/section = {sections_um:.1f} µm/section\n")
+
+    print(f"{'Sec':>4}  {'z_actual':>9}  {'z_fitted':>9}  {'resid_pl':>9}  {'resid_µm':>9}  status")
+    print("─" * 66)
+
+    corrections = {}
+    for s, z_a, z_f, r in zip(sections, z_vals, z_fitted, residuals):
+        r_um = r * czstack_z_um_per_plane
+        flag = "⚠  ADJUST" if abs(r_um) > residual_threshold_um else "✓"
+        print(f"{s:>4}  {z_a:>9.1f}  {z_f:>9.1f}  {r:>+9.1f}  {r_um:>+8.1f}µm  {flag}")
+        if abs(r_um) > residual_threshold_um:
+            corrections[s] = float(-r)   # delta to add to czstack_z to reach fitted position
+
+    print(f"\n{len(corrections)} section(s) flagged  (|residual| > {residual_threshold_um} µm)")
+    if corrections:
+        print("Suggested z corrections (czstack planes to add to every czstack_z landmark):")
+        for s, delta in sorted(corrections.items()):
+            corrected_z = results[s]['z_at_fov_center'] + delta
+            print(f"  Section {s:>3}:  {delta:+.1f} pl  ({delta * czstack_z_um_per_plane:+.1f} µm)"
+                  f"  →  corrected z_center = {corrected_z:.1f}")
+
+    return corrections
+
+
+def apply_section_z_corrections(sections_landmarks, sections_affines, corrections,
+                                 czstack_z_um_per_plane=1.0):
+    """
+    Apply z-only shifts to landmarks and recompute affines for flagged sections.
+
+    Only czstack_z landmark coordinates are modified — x/y are untouched, and the
+    XY components of every affine are unchanged.  The tilt coefficients (mat[2,0],
+    mat[2,1]) are preserved; only the z-offset constant (mat[2,3]) shifts because
+    get_alignment_transforms re-fits it from the corrected czstack_z values.
+
+    Parameters
+    ----------
+    sections_landmarks : sd.SpatialData
+        Points-only SpatialData with keys 'landmarks-{s_n}'.
+    sections_affines : dict {section_n: affines_dict}
+        Original affines from get_alignment_transforms.
+    corrections : dict {section_n: delta_z_planes}
+        Output of diagnose_section_z_placement, or manually specified.
+    czstack_z_um_per_plane : float
+        Used only for the printed summary.
+
+    Returns
+    -------
+    corrected_lm_dict : dict {section_n: pd.DataFrame}
+        All sections, corrected ones with shifted czstack_z.
+    corrected_affines : dict {section_n: affines_dict}
+        Recomputed affines for corrected sections; original affines for the rest.
+    """
+    from xenium_analysis_tools.alignment.align_sections import get_alignment_transforms
+
+    corrected_lm_dict  = {}
+    corrected_affines  = {}
+
+    print("Applying z corrections:")
+    for s_n, aff in sorted(sections_affines.items()):
+        lm = sections_landmarks.points[f'landmarks-{s_n}']
+        lm = lm.compute() if hasattr(lm, 'compute') else lm.copy()
+
+        if s_n in corrections:
+            delta = corrections[s_n]
+            lm = lm.copy()
+            lm['czstack_z'] = lm['czstack_z'] + delta
+            corrected_affines[s_n] = get_alignment_transforms(lm)
+            print(f"  Section {s_n:>3}: czstack_z shifted {delta:+.2f} pl "
+                  f"({delta * czstack_z_um_per_plane:+.2f} µm)  → affines recomputed")
+        else:
+            corrected_affines[s_n] = aff
+
+        corrected_lm_dict[s_n] = lm
+
+    print(f"\nDone. {len(corrections)} section(s) corrected, "
+          f"{len(sections_affines) - len(corrections)} unchanged.")
+    return corrected_lm_dict, corrected_affines
+
+
+def _build_section_colors(sections, pairs):
+    """Return a {section_n: hex_color} dict, shared by both plot functions."""
+    pair_hues = [
+        ('#4e9af1', '#1a5fa8'),
+        ('#3db87a', '#1a6e46'),
+        ('#e05c5c', '#8a1f1f'),
+        ('#b07fd4', '#6a3a9a'),
+        ('#50b8c4', '#1e6e7a'),
+        ('#f4a742', '#9a5e10'),
+    ]
+    bright_palette = [
+        '#4e9af1', '#3db87a', '#e05c5c', '#b07fd4',
+        '#50b8c4', '#f4a742', '#f17c4e', '#a8d44e',
+        '#f14eb0', '#4ef1d4', '#d4c44e', '#7a4ef1',
+        '#f1d44e', '#4ef17a', '#f14e7a', '#4eaff1',
+    ]
+    colors = {}
+    if pairs:
+        pair_idx = 0
+        for p in pairs:
+            if pair_idx < len(pair_hues):
+                colors[p[0]] = pair_hues[pair_idx][0]
+                colors[p[1]] = pair_hues[pair_idx][1]
+                pair_idx += 1
+        bright_idx = pair_idx * 2
+        for s_n in sections:
+            if s_n not in colors:
+                colors[s_n] = bright_palette[bright_idx % len(bright_palette)]
+                bright_idx += 1
+    else:
+        for i, s_n in enumerate(sections):
+            colors[s_n] = bright_palette[i % len(bright_palette)]
+    return colors
+
+
+def _draw_xz_side_view(ax, results, sections, pairs, colors, czstack_xy_um,
+                        czstack_depth_um, czstack_x_shape, title):
+    """Draw the XZ side-view panel onto *ax* (shared by plot functions)."""
+    paired = {s for p in pairs for s in p}
+    x_fov  = czstack_xy_um * czstack_x_shape
+
+    ax.set_facecolor('#0f1117')
+    ax.set_xlim(-5, x_fov + 100)
+    ax.set_ylim(czstack_depth_um + 10, -10)
+    ax.set_xlabel('x position in czstack (µm)', color='#8b9ab0', fontsize=9)
+    ax.set_ylabel('z depth (µm)', color='#8b9ab0', fontsize=9)
+    ax.set_title(title, color='#e2e8f0', fontsize=10, pad=8)
+    for spine in ax.spines.values():
+        spine.set_edgecolor('#2d3748')
+    ax.tick_params(colors='#8b9ab0', labelsize=8)
+    ax.yaxis.grid(True, color='#2d3748', linewidth=0.5, linestyle='--')
+    ax.set_axisbelow(True)
+
+    for s_a, s_b in pairs:
+        if s_a not in results or s_b not in results:
+            continue
+        z_lo = min(results[s_a]['z_min_in_fov'], results[s_b]['z_min_in_fov'])
+        z_hi = max(results[s_a]['z_max_in_fov'], results[s_b]['z_max_in_fov'])
+        ax.axhspan(z_lo, z_hi, xmin=0, xmax=x_fov / (x_fov + 100),
+                   color=colors[s_a], alpha=0.07, zorder=0)
+
+    for s_n in sections:
+        if s_n not in results:
+            continue
+        r   = results[s_n]
+        col = colors[s_n]
+        is_paired = s_n in paired
+        ax.plot([0, x_fov], [r['z_min_in_fov'], r['z_max_in_fov']],
+                color=col,
+                linewidth=2.5 if is_paired else 1.2,
+                solid_capstyle='round', alpha=0.95)
+        ax.text(x_fov + 5, r['z_at_fov_center'],
+                f'S{s_n}  {r["z_at_fov_center"]:.0f}µm  {r["tilt_deg"]:.2f}°',
+                color=col, fontsize=6.5, va='center',
+                fontweight='bold' if is_paired else 'normal')
+
+    legend_handles = []
+    for s_a, s_b in pairs:
+        if s_a not in results:
+            continue
+        legend_handles.append(
+            mlines.Line2D([], [], color=colors[s_a], linewidth=2.5,
+                          label=f'S{s_a}+S{s_b} (paired)'))
+    legend_handles.append(
+        mlines.Line2D([], [], color='#9b9b9b', linewidth=1.2,
+                      label='standalone sections'))
+    ax.legend(handles=legend_handles, fontsize=7,
+              facecolor='#1a2130', edgecolor='#2d3748',
+              labelcolor='#8b9ab0', loc='lower left')
 
 
 def plot_section_positions(results,
@@ -236,45 +469,11 @@ def plot_section_positions(results,
     if pairs is None:
         pairs = []
     paired = {s for p in pairs for s in p}
-    
-    # ── Color assignment ──────────────────────────────────────────────────
-    pair_hues = [
-        ('#4e9af1', '#1a5fa8'),
-        ('#3db87a', '#1a6e46'),
-        ('#e05c5c', '#8a1f1f'),
-        ('#b07fd4', '#6a3a9a'),
-        ('#50b8c4', '#1e6e7a'),
-        ('#f4a742', '#9a5e10'),
-    ]
-    # Bright palette for standalones (or all sections when no pairs given)
-    bright_palette = [
-        '#4e9af1', '#3db87a', '#e05c5c', '#b07fd4',
-        '#50b8c4', '#f4a742', '#f17c4e', '#a8d44e',
-        '#f14eb0', '#4ef1d4', '#d4c44e', '#7a4ef1',
-        '#f1d44e', '#4ef17a', '#f14e7a', '#4eaff1',
-    ]
 
-    colors = {}
-    if pairs:
-        pair_idx = 0
-        for p in pairs:
-            if pair_idx < len(pair_hues):
-                colors[p[0]] = pair_hues[pair_idx][0]
-                colors[p[1]] = pair_hues[pair_idx][1]
-                pair_idx += 1
-        # Standalones get remaining bright colors (skip hues already used by pairs)
-        bright_idx = pair_idx * 2  # rough offset past used pair colors
-        for s_n in sections:
-            if s_n not in colors:
-                colors[s_n] = bright_palette[bright_idx % len(bright_palette)]
-                bright_idx += 1
-    else:
-        # No pairs — assign bright colors directly, evenly spaced
-        for i, s_n in enumerate(sections):
-            colors[s_n] = bright_palette[i % len(bright_palette)]
+    colors = _build_section_colors(sections, pairs)
 
     # ── Pair membership lookup ────────────────────────────────────────────
-    pair_of = {}  # section → (s_a, s_b) tuple it belongs to
+    pair_of = {}
     for p in pairs:
         pair_of[p[0]] = p
         pair_of[p[1]] = p
@@ -284,59 +483,9 @@ def plot_section_positions(results,
 
     # ── Left: side view (XZ) ─────────────────────────────────────────────
     ax_xz = fig.add_subplot(gs[0])
-    ax_xz.set_facecolor('#0f1117')
-    x_fov = czstack_xy_um * czstack_x_shape
-
-    ax_xz.set_xlim(-5, x_fov + 90)
-    ax_xz.set_ylim(czstack_depth_um + 10, -10)
-    ax_xz.set_xlabel('x position in czstack (µm)', color='#8b9ab0', fontsize=9)
-    ax_xz.set_ylabel('z depth (µm)', color='#8b9ab0', fontsize=9)
-    ax_xz.set_title('Side view: section positions and tilt',
-                    color='#e2e8f0', fontsize=10, pad=8)
-    for spine in ax_xz.spines.values():
-        spine.set_edgecolor('#2d3748')
-    ax_xz.tick_params(colors='#8b9ab0', labelsize=8)
-    ax_xz.yaxis.grid(True, color='#2d3748', linewidth=0.5, linestyle='--')
-    ax_xz.set_axisbelow(True)
-
-    # Shade paired z-bands with the pair's light color
-    for s_a, s_b in pairs:
-        if s_a not in results or s_b not in results:
-            continue
-        z_lo = min(results[s_a]['z_min_in_fov'], results[s_b]['z_min_in_fov'])
-        z_hi = max(results[s_a]['z_max_in_fov'], results[s_b]['z_max_in_fov'])
-        ax_xz.axhspan(z_lo, z_hi, xmin=0, xmax=x_fov / (x_fov + 90),
-                      color=colors[s_a], alpha=0.07, zorder=0)
-
-    for s_n in sections:
-        r = results[s_n]
-        col = colors[s_n]
-        is_paired = s_n in paired
-        ax_xz.plot([0, x_fov], [r['z_min_in_fov'], r['z_max_in_fov']],
-                   color=col,
-                   linewidth=2.5 if is_paired else 1.2,
-                   linestyle='-',   # all solid — color encodes pairing
-                   solid_capstyle='round', alpha=0.95)
-        ax_xz.text(x_fov + 5, r['z_at_fov_center'],
-                   f'S{s_n}  {r["z_at_fov_center"]:.0f}µm  {r["tilt_deg"]:.2f}°',
-                   color=col, fontsize=6.5, va='center',
-                   fontweight='bold' if is_paired else 'normal')
-
-    # Legend: one entry per pair + standalones
-    legend_handles = []
-    for idx, (s_a, s_b) in enumerate(pairs):
-        if s_a not in results:
-            continue
-        h = mlines.Line2D([], [], color=colors[s_a], linewidth=2.5,
-                          label=f'S{s_a}+S{s_b} (paired)')
-        legend_handles.append(h)
-    legend_handles.append(
-        mlines.Line2D([], [], color='#9b9b9b', linewidth=1.2,
-                      label='standalone sections')
-    )
-    ax_xz.legend(handles=legend_handles, fontsize=7,
-                 facecolor='#1a2130', edgecolor='#2d3748',
-                 labelcolor='#8b9ab0', loc='lower left')
+    _draw_xz_side_view(ax_xz, results, sections, pairs, colors,
+                       czstack_xy_um, czstack_depth_um, czstack_x_shape,
+                       title='Side view: section positions and tilt')
 
     # ── Right: z-position chart ───────────────────────────────────────────
     ax_z = fig.add_subplot(gs[1])
@@ -440,6 +589,132 @@ def plot_section_positions(results,
         print(f"Saved to {save_path}")
     return fig                      
 
+
+def plot_z_correction_comparison(results_original, results_corrected,
+                                  czstack_xy_um=0.78125,
+                                  czstack_depth_um=450,
+                                  czstack_x_shape=512,
+                                  pairs=None,
+                                  corrections=None,
+                                  save_path=None):
+    """Side-by-side XZ side-view of section positions before and after z correction.
+
+    Parameters
+    ----------
+    results_original : dict
+        Output of `get_section_z_stats` before any correction.
+    results_corrected : dict
+        Output of `get_section_z_stats` after `apply_section_z_corrections`.
+    czstack_xy_um, czstack_depth_um, czstack_x_shape : float / int
+        Same physical parameters as `plot_section_positions`.
+    pairs : list of (int, int), optional
+        Paired section indices (same convention as `plot_section_positions`).
+    corrections : dict {section_n: delta_z_planes}, optional
+        Sections that were moved.  They are marked with a star ('*') in the
+        corrected panel title and with a dashed line style.
+    save_path : str or Path, optional
+        If provided the figure is saved there at 180 dpi.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    sections = sorted(set(results_original) | set(results_corrected))
+    if pairs is None:
+        pairs = []
+    if corrections is None:
+        corrections = {}
+
+    # Shared color scheme so corresponding sections look the same on both panels
+    colors = _build_section_colors(sections, pairs)
+
+    fig = plt.figure(figsize=(14, 6.5), facecolor='#0f1117')
+    gs  = GridSpec(1, 2, figure=fig, wspace=0.35)
+
+    # ── Left: original ────────────────────────────────────────────────────
+    ax_orig = fig.add_subplot(gs[0])
+    _draw_xz_side_view(ax_orig, results_original, sections, pairs, colors,
+                       czstack_xy_um, czstack_depth_um, czstack_x_shape,
+                       title='Original z-placement')
+
+    # ── Right: corrected ──────────────────────────────────────────────────
+    ax_corr = fig.add_subplot(gs[1])
+    ax_corr.set_facecolor('#0f1117')
+    for spine in ax_corr.spines.values():
+        spine.set_edgecolor('#2d3748')
+    ax_corr.tick_params(colors='#8b9ab0', labelsize=8)
+    ax_corr.yaxis.grid(True, color='#2d3748', linewidth=0.5, linestyle='--')
+    ax_corr.set_axisbelow(True)
+
+    paired = {s for p in pairs for s in p}
+    x_fov  = czstack_xy_um * czstack_x_shape
+
+    ax_corr.set_xlim(-5, x_fov + 100)
+    ax_corr.set_ylim(czstack_depth_um + 10, -10)
+    ax_corr.set_xlabel('x position in czstack (µm)', color='#8b9ab0', fontsize=9)
+    ax_corr.set_ylabel('z depth (µm)', color='#8b9ab0', fontsize=9)
+    n_corr = len(corrections)
+    corr_subtitle = (f'Corrected ({n_corr} section{"s" if n_corr != 1 else ""} adjusted)'
+                     if n_corr else 'Corrected (no changes)')
+    ax_corr.set_title(corr_subtitle, color='#e2e8f0', fontsize=10, pad=8)
+
+    # Shade paired z-bands from the corrected positions
+    for s_a, s_b in pairs:
+        if s_a not in results_corrected or s_b not in results_corrected:
+            continue
+        z_lo = min(results_corrected[s_a]['z_min_in_fov'],
+                   results_corrected[s_b]['z_min_in_fov'])
+        z_hi = max(results_corrected[s_a]['z_max_in_fov'],
+                   results_corrected[s_b]['z_max_in_fov'])
+        ax_corr.axhspan(z_lo, z_hi, xmin=0, xmax=x_fov / (x_fov + 100),
+                        color=colors[s_a], alpha=0.07, zorder=0)
+
+    for s_n in sections:
+        if s_n not in results_corrected:
+            continue
+        r   = results_corrected[s_n]
+        col = colors[s_n]
+        is_paired    = s_n in paired
+        was_corrected = s_n in corrections
+        ls  = '--' if was_corrected else '-'
+        lw  = 2.5 if is_paired else 1.2
+        ax_corr.plot([0, x_fov], [r['z_min_in_fov'], r['z_max_in_fov']],
+                     color=col, linewidth=lw, linestyle=ls,
+                     solid_capstyle='round', alpha=0.95)
+        star = ' ★' if was_corrected else ''
+        ax_corr.text(x_fov + 5, r['z_at_fov_center'],
+                     f'S{s_n}{star}  {r["z_at_fov_center"]:.0f}µm  {r["tilt_deg"]:.2f}°',
+                     color=col, fontsize=6.5, va='center',
+                     fontweight='bold' if is_paired else 'normal')
+
+    # Legend
+    legend_handles = []
+    for s_a, s_b in pairs:
+        if s_a not in results_corrected:
+            continue
+        legend_handles.append(
+            mlines.Line2D([], [], color=colors[s_a], linewidth=2.5,
+                          label=f'S{s_a}+S{s_b} (paired)'))
+    legend_handles.append(
+        mlines.Line2D([], [], color='#9b9b9b', linewidth=1.2,
+                      label='standalone sections'))
+    if corrections:
+        legend_handles.append(
+            mlines.Line2D([], [], color='#e2e8f0', linewidth=1.5,
+                          linestyle='--', label='★ z-corrected'))
+    ax_corr.legend(handles=legend_handles, fontsize=7,
+                   facecolor='#1a2130', edgecolor='#2d3748',
+                   labelcolor='#8b9ab0', loc='lower left')
+
+    fig.suptitle('Section z-placement: before vs after correction',
+                 color='#e2e8f0', fontsize=12, fontweight='bold', y=1.01)
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=180, bbox_inches='tight',
+                    facecolor=fig.get_facecolor())
+        print(f"Saved to {save_path}")
+    return fig
 
 
 ###### QC

@@ -107,6 +107,43 @@ def get_dataset_paths(dataset_id,
         datasets_naming_dict = json.load(f)
     dataset_id = str(dataset_id)  # Ensure string format
     dataset_config = datasets_naming_dict[dataset_id]
+
+    zstack_data_asset_folder = dataset_config.get("zstack_data_asset_folder")
+    zstack_masks_folder = dataset_config.get("zstack_masks_folder")
+    legacy_zstack_path = data_root / dataset_config["zstack_name"] if dataset_config.get("zstack_name") else None
+    legacy_zstack_masks = data_root / dataset_config["zstack_masks_name"] if dataset_config.get("zstack_masks_name") else None
+
+    zstack_path = (
+        data_root / zstack_data_asset_folder
+        if zstack_data_asset_folder
+        else legacy_zstack_path
+    )
+    zstack_masks = (
+        data_root / zstack_masks_folder
+        if zstack_masks_folder
+        else legacy_zstack_masks
+    )
+
+    zstack_img_gcamp_path = (
+        zstack_path / dataset_config["zstack_img_gcamp_path"]
+        if zstack_path is not None and dataset_config.get("zstack_img_gcamp_path")
+        else None
+    )
+    zstack_masks_gcamp_path = (
+        zstack_masks / dataset_config["zstack_masks_gcamp_path"]
+        if zstack_masks is not None and dataset_config.get("zstack_masks_gcamp_path")
+        else None
+    )
+    zstack_img_dextran_path = (
+        zstack_path / dataset_config["zstack_img_dextran_path"]
+        if zstack_path is not None and dataset_config.get("zstack_img_dextran_path")
+        else None
+    )
+    zstack_masks_dextran_path = (
+        zstack_masks / dataset_config["zstack_masks_dextran_path"]
+        if zstack_masks is not None and dataset_config.get("zstack_masks_dextran_path")
+        else None
+    )
     
     paths = {
         "data_root": data_root,
@@ -116,8 +153,12 @@ def get_dataset_paths(dataset_id,
         "sdata_path": data_root / f'{dataset_config["xenium_name"]}_processed' if dataset_config.get("xenium_name") else None,
         "confocal_path": data_root / dataset_config["confocal_name"] if dataset_config.get("confocal_name") else None,
         "raw_confocal_path": data_root / dataset_config["raw_confocal_name"] if dataset_config.get("raw_confocal_name") else None,
-        "zstack_path": data_root / dataset_config["zstack_name"] if dataset_config.get("zstack_name") else None,
-        "zstack_masks": data_root / dataset_config["zstack_masks_name"] if dataset_config.get("zstack_masks_name") else None,
+        "zstack_path": zstack_path,
+        "zstack_masks": zstack_masks,
+        "zstack_img_gcamp_path": zstack_img_gcamp_path,
+        "zstack_masks_gcamp_path": zstack_masks_gcamp_path,
+        "zstack_img_dextran_path": zstack_img_dextran_path,
+        "zstack_masks_dextran_path": zstack_masks_dextran_path,
     }
     
     return paths

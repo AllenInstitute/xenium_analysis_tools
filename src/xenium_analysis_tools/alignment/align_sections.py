@@ -287,16 +287,6 @@ def get_alignment_transforms(landmarks):
     xenium_lm  = landmarks[['x', 'y', 'z']].values.astype(float)
 
     # ── 4b. Normalize section landmarks to full-res (global) pixel space ──
-    # Landmarks are stored in matched-pyramid-level pixel space, with the
-    # 'global' transform (e.g. Scale([4, 4])) recording the level→full-res
-    # scale factor.  add_affine_to_element prepends that same scale as the
-    # first step of every stored transform so that level-N element pixels are
-    # upscaled to full-res before the Affine is applied.  The Affine must
-    # therefore be fit in *full-res* pixel space so the two match.
-    #
-    # Without this step the Affine is fit on level-2 coords (0..~2500) but
-    # receives level-2 × 4 = full-res (0..~10000) at apply time → 4× wrong
-    # output coordinates → section appears 4× too large in czstack_microns.
     try:
         lm_global_tf = get_transformation(landmarks, to_coordinate_system='global')
         if lm_global_tf is not None and not isinstance(lm_global_tf, Identity):
@@ -328,102 +318,127 @@ def get_alignment_transforms(landmarks):
     }
     return section_affines       
 
-def adjust_3d_images_z_scaling(sdata, sections_depth, elements_3d=['dapi_zstack'], center_z=True):
+def _rescale_z(tf, mps, z_offset=0.0):
+    """Return a new transform with the z-scale replaced by *mps* and z shifted by *z_offset*.
+
+    Works for Scale, Sequence, Identity, or Affine inputs.  Does not mutate the
+    input transform.  The z-scale replacement and optional centering translation
+    are applied in a single pass — no double-nesting of Sequences.
+    """
+    def _replace_z_in_scale(t):
+        axes = list(t.axes)
+        vals = list(t.scale)
+        vals[axes.index('z')] = mps
+        return Scale(vals, axes=t.axes)
+
+    if isinstance(tf, Identity):
+        result = Scale([mps, 1.0, 1.0], axes=('z', 'y', 'x'))
+    elif isinstance(tf, Scale):
+        if 'z' in tf.axes:
+            result = _replace_z_in_scale(tf)
+        else:
+            result = Sequence([Scale([mps], axes=('z',)), tf])
+    elif isinstance(tf, Sequence):
+        tfs = list(tf.transformations)
+        for i, t in enumerate(tfs):
+            if isinstance(t, Scale) and 'z' in t.axes:
+                tfs[i] = _replace_z_in_scale(t)
+                break
+        else:
+            # No z-bearing Scale found — prepend one
+            tfs = [Scale([mps], axes=('z',))] + tfs
+        result = Sequence(tfs)
+    else:
+        # Affine or other: wrap with z-scale prepended
+        result = Sequence([Scale([mps], axes=('z',)), tf])
+
+    # Append z centering as a single translation Affine (one extra step, not a second pass)
+    if z_offset != 0.0:
+        mat = np.eye(4)
+        mat[2, 3] = z_offset  # row 2 = z output, col 3 = translation
+        z_center_tf = Affine(mat, input_axes=('x', 'y', 'z'), output_axes=('x', 'y', 'z'))
+        if isinstance(result, Sequence):
+            result = Sequence(list(result.transformations) + [z_center_tf])
+        else:
+            result = Sequence([result, z_center_tf])
+
+    return result
+
+
+def adjust_3d_images_z_scaling(sdata, sections_depth, elements_3d=None, center_z=True):
     """
     Rescale the z-axis of 3D section images to match the known section thickness.
 
-    If center_z=True (default), the slab is further shifted so that z=0 in global/microns
-    space corresponds to the section midplane.  This is the physically correct convention
-    because the 2D landmark affine was fit to a projection of the whole section volume,
-    so z=0 should represent the center of that volume rather than its bottom edge.
+    If center_z=True (default), the slab is further shifted so that z=0 corresponds
+    to the section midplane (range: -sections_depth/2 .. +sections_depth/2 µm),
+    matching the convention used by adjust_transcripts_z_scaling.
 
-    The z-step uses ``sections_depth / (z_planes - 1)`` so that the first and last planes
-    sit exactly at ±sections_depth/2, matching the transcript z-range produced by
-    ``adjust_transcripts_z_scaling``.  This prevents empty planes from appearing in napari
-    after the transcripts have ended.
+    The z-step is sections_depth / (n_z - 1) so the first and last planes sit exactly
+    at ±sections_depth/2 — no empty planes appear in Napari after the transcripts end.
+
+    All coordinate systems already registered on each pyramid level are updated;
+    there is no need to pass a coordinate-system list.
     """
-    for el in elements_3d:
-        if el not in sdata:
+    if elements_3d is None:
+        elements_3d = ['dapi_zstack']
+
+    for el_name in elements_3d:
+        if el_name not in sdata:
             continue
-            
-        for scale in sdata[el].keys():
-            img = sdata[el][scale].image if hasattr(sdata[el][scale], 'image') else sdata[el][scale]
-            z_planes = img.sizes.get('z', img.shape[0])
-            if z_planes < 2:
-                continue  # single-plane: nothing meaningful to rescale
-            microns_per_slice = sections_depth / (z_planes - 1)
+        el = sdata[el_name]
 
-            def update_z_scale(tf):
-                if isinstance(tf, Identity):
-                    return Scale([microns_per_slice, 1.0, 1.0], axes=('z', 'y', 'x'))
-                elif isinstance(tf, Scale):
-                    if 'z' in tf.axes:
-                        new_scale = list(tf.scale)
-                        new_scale[list(tf.axes).index('z')] = microns_per_slice
-                        return Scale(new_scale, axes=tf.axes)
-                    return Sequence([Scale([microns_per_slice], axes=('z',)), tf])
-                elif isinstance(tf, Sequence):
-                    new_tfs = [
-                        Scale(
-                            [microns_per_slice if ax == 'z' else s for ax, s in zip(t.axes, t.scale)],
-                            axes=t.axes
-                        ) if isinstance(t, Scale) and 'z' in t.axes else t
-                        for t in tf.transformations
-                    ]
-                    if not any(isinstance(t, Scale) and 'z' in t.axes for t in new_tfs):
-                        new_tfs = [Scale([microns_per_slice, 1.0, 1.0], axes=('z', 'y', 'x'))] + new_tfs
-                    return Sequence(new_tfs)
-                return Sequence([Scale([microns_per_slice], axes=('z',)), tf])
+        # Iterate over every pyramid level robustly
+        if _is_multiscale(el):
+            level_imgs = [sd.get_pyramid_levels(el, n=i) for i in range(len(el.keys()))]
+        else:
+            level_imgs = [el]
 
-            for cs in ['global', 'microns']:
-                existing_tf = get_transformation(img, to_coordinate_system=cs)
-                if existing_tf is not None:
-                    new_tf = update_z_scale(existing_tf)
-                    set_transformation(img, new_tf, to_coordinate_system=cs)
+        for img in level_imgs:
+            # Robust z-dimension check — never falls back to shape[0] (= c dim)
+            if not (hasattr(img, 'dims') and 'z' in img.dims):
+                continue
+            n_z = img.sizes['z']
+            if n_z < 2:
+                continue
 
-            # Center the slab: shift z so the midplane (z_image=(z_planes-1)/2) maps to z=0.
-            # With mps = sections_depth/(z_planes-1), plane 0 → -sections_depth/2 and
-            # plane (z_planes-1) → +sections_depth/2, exactly matching transcript z range.
-            if center_z:
-                z_center_offset = -(z_planes - 1) / 2.0 * microns_per_slice
-                center_mat = np.eye(4)
-                center_mat[2, 3] = z_center_offset
-                center_tf_3d = Affine(center_mat, input_axes=('x', 'y', 'z'), output_axes=('x', 'y', 'z'))
-                for cs in ['global', 'microns']:
-                    existing_tf = get_transformation(img, to_coordinate_system=cs)
-                    if existing_tf is not None:
-                        set_transformation(img, Sequence([existing_tf, center_tf_3d]), to_coordinate_system=cs)
+            mps = sections_depth / (n_z - 1)  # microns per z-step at this level
+            z_offset = -(n_z - 1) / 2.0 * mps if center_z else 0.0
+
+            # Update every coord system present — not just a hardcoded subset
+            for cs, existing_tf in get_transformation(img, get_all=True).items():
+                set_transformation(img, _rescale_z(existing_tf, mps, z_offset),
+                                   to_coordinate_system=cs)
     return sdata
+
 
 def adjust_transcripts_z_scaling(sdata, sections_depth, center_z=True):
     """
     Rescale transcript z-coordinates so they span the known section thickness.
 
-    If center_z=True (default), z-coordinates are further shifted so that z=0 corresponds
-    to the section midplane (range: -sections_depth/2 .. +sections_depth/2 µm).  This
-    matches the centered convention used by adjust_3d_images_z_scaling so that transcripts
-    and the DAPI z-stack share the same z=0 reference point.
+    If center_z=True (default), z=0 is the section midplane
+    (range: -sections_depth/2 .. +sections_depth/2 µm), matching
+    adjust_3d_images_z_scaling so transcripts and the DAPI z-stack share the
+    same z=0 reference point.
     """
-    if 'original_z_coords' not in sdata['transcripts'].columns:
-        z_coords = sdata['transcripts']['z']
-        sdata['transcripts']['original_z_coords'] = z_coords
-    else:
-        z_coords = sdata['transcripts']['original_z_coords']
-    
-    z_min, z_max = z_coords.min().compute(), z_coords.max().compute()
-    tx_z_span = z_max - z_min
-    
-    if tx_z_span == 0:
-        print(f"  Warning: transcript z-span is zero, skipping z scaling.")
+    tx = sdata['transcripts']
+    if 'original_z_coords' not in tx.columns:
+        tx['original_z_coords'] = tx['z']
+    z = tx['original_z_coords']
+
+    # Single compute call — avoids triggering the dask graph twice
+    z_stats = z.agg(['min', 'max']).compute()
+    z_min, z_max = float(z_stats['min']), float(z_stats['max'])
+    z_span = z_max - z_min
+
+    if z_span == 0:
+        import warnings
+        warnings.warn("Transcript z-span is zero; skipping z scaling.")
         return sdata
-    
-    microns_thickness_scale = sections_depth / tx_z_span
-    scaled_z = (z_coords - z_min) * microns_thickness_scale
-    # Center around z=0 so the middle of the transcript volume coincides with
-    # the 2D section plane (z=0 in section space = the landmark-fitted position).
+
+    scaled_z = (z - z_min) * (sections_depth / z_span)
     if center_z:
         scaled_z = scaled_z - sections_depth / 2.0
-    sdata['transcripts']['z'] = scaled_z
+    tx['z'] = scaled_z
     return sdata
 
 def _shift_transform_origin_along_z(tf, z_offset):

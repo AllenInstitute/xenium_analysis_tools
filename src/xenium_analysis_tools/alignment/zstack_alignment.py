@@ -145,3 +145,5 @@ def generate_zstack_sdata(zstacks_path, zstack_masks_path, image_chunk_size=(1, 
         sdata = add_micron_coord_sys(sdata, pixel_size=[sdata['zstack'].attrs['scale_y'], sdata['zstack'].attrs['scale_x']], z_step=sdata['zstack'].attrs['scale_z'])
         sdata_dict[sdata_name] = sdata
     return sdata_dict
+
+def __main
