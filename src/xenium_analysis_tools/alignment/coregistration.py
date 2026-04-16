@@ -25,6 +25,24 @@ from xenium_analysis_tools.alignment.format_for_napari import (
 
 from spatialdata.models import TableModel
 
+def get_scale_pixel_size(el, microns_coord_sys_name='microns'):
+    microns_tf = get_transformation(el, to_coordinate_system=microns_coord_sys_name)
+
+    if isinstance(microns_tf, Scale):
+        pixel_size_yx = [microns_tf.scale[microns_tf.axes.index(d)] for d in ['y', 'x']]
+    elif isinstance(microns_tf, Identity):
+        pixel_size_yx = [1.0, 1.0]
+    elif isinstance(microns_tf, Sequence):
+        py, px = 1.0, 1.0
+        for tf in microns_tf.transformations:
+            if isinstance(tf, Scale):
+                py *= tf.scale[tf.axes.index('y')]
+                px *= tf.scale[tf.axes.index('x')]
+        pixel_size_yx = [py, px]
+    else:
+        pixel_size_yx = None
+        print(f'  Warning: unhandled transform type {type(microns_tf)}, skipping calibration')
+    return pixel_size_yx
 
 def _rename_channel_coord(element_obj, channel_name_map=None):
     if channel_name_map is None:
@@ -91,10 +109,9 @@ def get_cell_labels(section_sdata, table_el='table', labels_el='cell_labels', mu
 
     return cell_labels_sd
 
-
-def extract_bigwarp_images_for_section(section_sdata, 
-                                        section_n, 
-                                        bigwarp_projects_folder,
+def extract_bigwarp_images(sdata, 
+                                       bigwarp_projects_folder,
+                                        section_n=None, 
                                         el_name = 'morphology_focus',
                                         subset_channels = 'all',
                                         multiscale_level = 2,
@@ -103,22 +120,29 @@ def extract_bigwarp_images_for_section(section_sdata,
                                         z_step_um=None,
                                         resunit = 'cm',
                                         microns_coord_sys_name = 'microns',
+                                        save_name=None,
                                         return_sdata=True):
-    section_bigwarp_folder = bigwarp_projects_folder / f'section_{section_n}'
-    section_bigwarp_folder.mkdir(exist_ok=True, parents=True)
-    if not isinstance(section_sdata, sd.SpatialData):
-        section_sdata = sd.read_zarr(section_sdata)    
-    section_sdata = add_micron_coord_sys(section_sdata)
-    if _is_multiscale(section_sdata[el_name]):
-        mf_element = sd.get_pyramid_levels(section_sdata[el_name], n=multiscale_level)
+    if section_n is not None:
+        save_bigwarp_folder = bigwarp_projects_folder / f'section_{section_n}'
+        save_bigwarp_folder.mkdir(exist_ok=True, parents=True)
+        out_path = None
     else:
-        mf_element = section_sdata[el_name]
+        save_bigwarp_folder = bigwarp_projects_folder
+        save_bigwarp_folder.mkdir(exist_ok=True, parents=True)
+    if not isinstance(sdata, sd.SpatialData):
+        sdata = sd.read_zarr(sdata)
+    if microns_coord_sys_name not in sdata.coordinate_systems:  
+        sdata = add_micron_coord_sys(sdata)
+    if _is_multiscale(sdata[el_name]):
+        mf_element = sd.get_pyramid_levels(sdata[el_name], n=multiscale_level)
+    else:
+        mf_element = sdata[el_name]
     mf_element = _rename_channel_coord(mf_element)
     if subset_channels == 'all':
         subset_channels = mf_element.coords['c'].values
 
-    for ch in tqdm(subset_channels, desc=f'Extracting channels for section {section_n}'):
-        out_path = section_bigwarp_folder / f'{ch}.tif'
+    for ch in tqdm(subset_channels, desc=f'Extracting channels'):
+        out_path = save_bigwarp_folder / f'{ch}.tif'
         ch_el = mf_element.sel(c=ch)
         dims = ch_el.dims
         microns_tf = get_transformation(ch_el, to_coordinate_system=microns_coord_sys_name)
@@ -138,7 +162,6 @@ def extract_bigwarp_images_for_section(section_sdata,
         else:
             pixel_size_yx = None
             print(f'  Warning: unhandled transform type {type(microns_tf)} for channel {ch}, skipping calibration')
-
 
         arr = ch_el.data.compute()
         if np.issubdtype(np.dtype(dtype), np.integer) and normalize:
@@ -168,21 +191,24 @@ def extract_bigwarp_images_for_section(section_sdata,
         tifffile.imwrite(str(out_path), arr, **kwargs)
 
     if return_sdata:
-        return section_sdata
+        return sdata
     
-def extract_bigwarp_label_for_section(
+def extract_bigwarp_labels(
     labels_el,
     labels_name,
-    section_n,
     bigwarp_projects_folder,
+    section_n=None,
     microns_coord_sys_name='microns',
     dtype='uint8',
     binary=True,
     z_step_um=None,
     resunit='cm'
 ):
-    section_bigwarp_folder = bigwarp_projects_folder / f'section_{section_n}'
-    out_path = section_bigwarp_folder / f'{labels_name}.tif'
+    if section_n is None:
+        save_bigwarp_folder = bigwarp_projects_folder
+    else:
+        save_bigwarp_folder = bigwarp_projects_folder / f'section_{section_n}'
+    out_path = save_bigwarp_folder / f'{labels_name}.tif'
 
     # Get the labels DataArray — handle SpatialData objects and raw DataArrays
     if isinstance(labels_el, sd.SpatialData):
@@ -231,6 +257,6 @@ def extract_bigwarp_label_for_section(
         kwargs['resolution'] = resolution_um if resunit == 'um' else resolution_cm
         kwargs['resolutionunit'] = tifffile.RESUNIT.MICROMETER if resunit == 'um' else tifffile.RESUNIT.CENTIMETER
 
-    section_bigwarp_folder.mkdir(exist_ok=True, parents=True)
+    save_bigwarp_folder.mkdir(exist_ok=True, parents=True)
     tifffile.imwrite(str(out_path), arr, **kwargs)
     print(f'  Wrote: {out_path.name}  shape={arr.shape}  binary={binary}')
