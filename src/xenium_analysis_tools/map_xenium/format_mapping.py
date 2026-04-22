@@ -257,29 +257,31 @@ def add_colormap_adata(adata, colormap):
             return 'gray'  # Default to 'gray' if invalid
 
     broad_class_name_colors = []
-    for tp in sorted(adata.obs['broad_class_name'].unique()):
-        color = validate_color(colormap.get(tp, 'gray'))
-        broad_class_name_colors.append(color)
+    if 'broad_class_name' in adata.obs.columns:
+        for tp in sorted(adata.obs['broad_class_name'].unique()):
+            color = validate_color(colormap.get(tp, 'gray'))
+            broad_class_name_colors.append(color)
+        adata.uns['broad_class_name_colors'] = np.array(broad_class_name_colors, dtype=object)
 
     broad_subclass_name_colors = []
-    for tp in sorted(adata.obs['broad_subclass_name'].unique()):
-        color = validate_color(colormap.get(tp, 'gray'))
-        broad_subclass_name_colors.append(color)
+    if 'broad_subclass_name' in adata.obs.columns:
+        for tp in sorted(adata.obs['broad_subclass_name'].unique()):
+            color = validate_color(colormap.get(tp, 'gray'))
+            broad_subclass_name_colors.append(color)
+        adata.uns['broad_subclass_name_colors'] = np.array(broad_subclass_name_colors, dtype=object)
 
     subclass_colors = []
-    for tp in sorted(adata.obs['subclass_name'].unique()):
-        color = validate_color(colormap.get(tp, 'gray'))
-        subclass_colors.append(color)
+    if 'subclass_name' in adata.obs.columns:
+        for tp in sorted(adata.obs['subclass_name'].unique()):
+            color = validate_color(colormap.get(tp, 'gray'))
+            subclass_colors.append(color)
+        adata.uns['subclass_name_colors'] = np.array(subclass_colors, dtype=object)
 
     supertype_colors = []
-    for tp in sorted(adata.obs['supertype_name'].unique()):
-        color = validate_color(colormap.get(tp, 'gray'))
-        supertype_colors.append(color)
-
-    # Store as numpy arrays
-    adata.uns['broad_class_name_colors'] = np.array(broad_class_name_colors, dtype=object)
-    adata.uns['broad_subclass_name_colors'] = np.array(broad_subclass_name_colors, dtype=object)
-    adata.uns['supertype_name_colors'] = np.array(supertype_colors, dtype=object)
-    adata.uns['subclass_name_colors'] = np.array(subclass_colors, dtype=object)
+    if 'supertype_name' in adata.obs.columns:
+        for tp in sorted(adata.obs['supertype_name'].unique()):
+            color = validate_color(colormap.get(tp, 'gray'))
+            supertype_colors.append(color)
+        adata.uns['supertype_name_colors'] = np.array(supertype_colors, dtype=object)
 
     return adata

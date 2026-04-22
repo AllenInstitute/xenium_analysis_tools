@@ -124,6 +124,7 @@ def get_fov_sdata(
             min_coordinate=min_coords,
             max_coordinate=max_coords,
             target_coordinate_system=target_coordinate_system,
+            filter_table=False,
         )
     finally:
         sdata.points = points_backup
@@ -1186,6 +1187,8 @@ def add_cell_matcher(
     xenium_layer_prefix='cell_labels',
     output_path='cell_matches.csv',
     coord_system='czstack_microns',
+    sdata=None,
+    gcamp_table_key='gcamp_table',
 ):
     """
     Add an interactive cell-matching dock widget to an existing napari viewer.
@@ -1355,6 +1358,9 @@ def add_cell_matcher(
         btn_row.addWidget(b)
     layout.addLayout(btn_row)
 
+    update_completed_btn = QPushButton("Update completed cells")
+    layout.addWidget(update_completed_btn)
+
     status = QLabel("")
     status.setWordWrap(True)
     layout.addWidget(status)
@@ -1484,6 +1490,61 @@ def add_cell_matcher(
         _refresh_table()
         status.setText(f"Undid last row: GCaMP {removed[0]}  ↔  Xenium {removed[1]}  ({removed[2]})")
 
+    def _update_completed_cells():
+        matched_gcamp_ids = {m[0] for m in matches}
+
+        gcamp_layer = next(
+            (l for l in viewer.layers
+             if isinstance(l, _napari.layers.Labels) and l.name.startswith(gcamp_layer_prefix)),
+            None,
+        )
+        if gcamp_layer is None:
+            status.setText("Could not find GCaMP labels layer.")
+            return
+
+        if sdata is None or gcamp_table_key not in sdata.tables:
+            status.setText("Pass sdata= to add_cell_matcher to enable completed-cell highlighting.")
+            return
+
+        gcamp_table = sdata.tables[gcamp_table_key]
+        attrs = gcamp_table.uns.get('spatialdata_attrs', {})
+        instance_key = attrs.get('instance_key', 'label')
+
+        if instance_key not in gcamp_table.obs.columns:
+            status.setText(f"Instance key '{instance_key}' not found in gcamp_table.obs.")
+            return
+
+        label_ids = gcamp_table.obs[instance_key].values
+
+        # Update the active napari-spatialdata annotation column so re-application
+        # callbacks produce the correct colors if the user interacts with the GUI.
+        gcamp_table.obs['cell_labels_color'] = pd.Categorical(
+            ['matched' if int(lid) in matched_gcamp_ids else 'unmatched' for lid in label_ids],
+            categories=['unmatched', 'matched'],
+        )
+        gcamp_table.uns['cell_labels_color_colors'] = np.array(['#2323ff', '#ff0000'])
+
+        # Also persist for downstream analysis
+        gcamp_table.obs['is_matched'] = gcamp_table.obs['cell_labels_color']
+        gcamp_table.uns['is_matched_colors'] = gcamp_table.uns['cell_labels_color_colors'].copy()
+
+        # napari >=0.4.20 uses DirectLabelColormap on layer.colormap, not layer.color
+        from collections import defaultdict
+        from napari.utils.colormaps import DirectLabelColormap
+
+        red         = np.array([1.0, 0.0, 0.0, 1.0])
+        blue        = np.array([35/255, 35/255, 1.0, 1.0])   # #2323ff
+        transparent = np.zeros(4)
+
+        cmap_dict = defaultdict(lambda: transparent)
+        for lid in label_ids:
+            cmap_dict[int(lid)] = red if int(lid) in matched_gcamp_ids else blue
+
+        gcamp_layer.colormap = DirectLabelColormap(color_dict=cmap_dict)
+
+        n = len(matched_gcamp_ids)
+        status.setText(f"Updated: {n} matched GCaMP {'cell' if n == 1 else 'cells'} highlighted.")
+
     def _delete_selected():
         selected_rows = {idx.row() for idx in table.selectedIndexes()}
         if not selected_rows:
@@ -1514,11 +1575,17 @@ def add_cell_matcher(
             status.setText("No coordinates stored for this row (loaded from older CSV).")
             return
         z, y, x = pos
-        # Move z-slider to the cell's plane
-        viewer.dims.set_point(0, z)
-        viewer.camera.center = (z, y, x)
+        # z is stored as the integer step index at pick time; restore it directly.
+        # For a 3D labels layer in an N-dim viewer, z lives at viewer axis (ndim - 3).
+        # camera.center uses world coordinates (y, x) in 2D mode.
+        z_step = int(round(z))
+        z_axis = max(0, viewer.dims.ndim - 3)
+        steps = list(viewer.dims.current_step)
+        steps[z_axis] = z_step
+        viewer.dims.current_step = tuple(steps)
+        viewer.camera.center = (y, x)
         label = 'GCaMP' if col == 0 else 'Xenium'
-        status.setText(f"Navigated to {label} cell — z={z:.2f}, y={y:.2f}, x={x:.2f}")
+        status.setText(f"Navigated to {label} cell — z_step={z_step} (axis {z_axis}), y={y:.2f}, x={x:.2f}")
 
     def _show_row_coords():
         selected = table.selectedItems()
@@ -1557,7 +1624,10 @@ def add_cell_matcher(
                     status.setText("Clicked background in GCaMP layer. Try again.")
                 else:
                     state['gcamp_id'] = int(val)
-                    state['gcamp_pos'] = _label_centroid_world(layer, val)
+                    centroid = _label_centroid_world(layer, val)
+                    z_axis = viewer.dims.ndim - layer.ndim
+                    z_step = float(viewer.dims.current_step[z_axis])
+                    state['gcamp_pos'] = (z_step, centroid[1], centroid[2]) if centroid else None
                     _refresh_pending()
                     _check_dupes()
                     status.setText(f"GCaMP cell {val} picked.")
@@ -1568,7 +1638,10 @@ def add_cell_matcher(
                 else:
                     state['xenium_hits'] = hits
                     # Use centroid of first hit layer for navigation (representative position)
-                    state['xenium_pos'] = _label_centroid_world(hit_layers[0], hits[0][0])
+                    centroid = _label_centroid_world(hit_layers[0], hits[0][0])
+                    z_axis = viewer.dims.ndim - hit_layers[0].ndim
+                    z_step = float(viewer.dims.current_step[z_axis])
+                    state['xenium_pos'] = (z_step, centroid[1], centroid[2]) if centroid else None
                     _refresh_pending()
                     _check_dupes()
                     if warn:
@@ -1581,29 +1654,6 @@ def add_cell_matcher(
 
     viewer.mouse_drag_callbacks.append(_on_canvas_click)
 
-    # # ------------------------------------------------------------------
-    # # Z-slider section boundary notifications
-    # # ------------------------------------------------------------------
-    # _z_section_state = {'last_sections': set()}
-
-    # def _on_z_change():
-    #     current_z = viewer.dims.point[0]
-    #     active_now = set()
-    #     for layer in viewer.layers:
-    #         if isinstance(layer, _napari.layers.Labels) and layer.name.startswith(xenium_layer_prefix):
-    #             zmin, zmax = layer.extent.world[0][0], layer.extent.world[1][0]
-    #             if zmin <= current_z <= zmax:
-    #                 active_now.add(layer.name)
-    #     entered = active_now - _z_section_state['last_sections']
-    #     exited  = _z_section_state['last_sections'] - active_now
-    #     if entered or exited:
-    #         msgs = [f"Entering {n}" for n in sorted(entered)] + \
-    #                [f"Leaving {n}"  for n in sorted(exited)]
-    #         status.setText("  |  ".join(msgs))
-    #     _z_section_state['last_sections'] = active_now
-
-    # viewer.dims.events.current_step.connect(_on_z_change)
-
     table.cellDoubleClicked.connect(_navigate_to)
     table.itemSelectionChanged.connect(_show_row_coords)
 
@@ -1613,6 +1663,7 @@ def add_cell_matcher(
     clear_btn.clicked.connect(_clear)
     undo_btn.clicked.connect(_undo)
     delete_sel_btn.clicked.connect(_delete_selected)
+    update_completed_btn.clicked.connect(_update_completed_cells)
 
     _refresh_table()
     _refresh_pending()
