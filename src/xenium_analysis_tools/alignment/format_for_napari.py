@@ -13,6 +13,17 @@ import dask.dataframe as dd
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 
+
+def filter_to_fov(plot_sdata_fov, sections_to_view):
+    for s_n in sections_to_view:
+        labels = np.unique(plot_sdata_fov[f'cell_labels-{s_n}'].compute())
+        labels = labels[labels!=0]
+        plot_sdata_fov['table'].obs['in_fov'] = (plot_sdata_fov['table'].obs['section']==s_n) & (plot_sdata_fov['table'].obs['cell_labels'].isin(labels))
+        plot_sdata_fov[f'transcripts-{s_n}']['in_fov'] = (plot_sdata_fov[f'transcripts-{s_n}']['section']==s_n) & (plot_sdata_fov[f'transcripts-{s_n}']['cell_labels'].isin(labels))
+        plot_sdata_fov[f'transcripts-{s_n}'] = plot_sdata_fov[f'transcripts-{s_n}'][plot_sdata_fov[f'transcripts-{s_n}']['in_fov']]
+    plot_sdata_fov['table'] = plot_sdata_fov['table'][plot_sdata_fov['table'].obs['in_fov']]
+    return  plot_sdata_fov
+
 def filter_labels(sdata, label_elements='cell_labels', table='table', key_col='cell_labels'):
     # Get all label elements that match the specified prefix
     labels = [lbl for lbl in sdata.labels.keys() if lbl.startswith(label_elements)]
