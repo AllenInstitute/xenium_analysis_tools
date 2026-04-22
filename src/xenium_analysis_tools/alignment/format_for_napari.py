@@ -15,14 +15,24 @@ import matplotlib.colors as mcolors
 
 
 def filter_to_fov(plot_sdata_fov, sections_to_view):
+    plot_sdata_fov['table'].obs['in_fov'] = False
     for s_n in sections_to_view:
         labels = np.unique(plot_sdata_fov[f'cell_labels-{s_n}'].compute())
         labels = labels[labels!=0]
-        plot_sdata_fov['table'].obs['in_fov'] = (plot_sdata_fov['table'].obs['section']==s_n) & (plot_sdata_fov['table'].obs['cell_labels'].isin(labels))
-        plot_sdata_fov[f'transcripts-{s_n}']['in_fov'] = (plot_sdata_fov[f'transcripts-{s_n}']['section']==s_n) & (plot_sdata_fov[f'transcripts-{s_n}']['cell_labels'].isin(labels))
-        plot_sdata_fov[f'transcripts-{s_n}'] = plot_sdata_fov[f'transcripts-{s_n}'][plot_sdata_fov[f'transcripts-{s_n}']['in_fov']]
-    plot_sdata_fov['table'] = plot_sdata_fov['table'][plot_sdata_fov['table'].obs['in_fov']]
-    return  plot_sdata_fov
+        section_mask = (plot_sdata_fov['table'].obs['section']==s_n) & (plot_sdata_fov['table'].obs['cell_labels'].isin(labels))
+        plot_sdata_fov['table'].obs['in_fov'] = plot_sdata_fov['table'].obs['in_fov'] | section_mask
+        tx_mask = (plot_sdata_fov[f'transcripts-{s_n}']['section']==s_n) & (plot_sdata_fov[f'transcripts-{s_n}']['cell_labels'].isin(labels))
+        plot_sdata_fov[f'transcripts-{s_n}'] = plot_sdata_fov[f'transcripts-{s_n}'][tx_mask]
+    filtered_table = plot_sdata_fov['table'][plot_sdata_fov['table'].obs['in_fov']].copy()
+    if 'spatialdata_attrs' in filtered_table.uns:
+        attrs = filtered_table.uns['spatialdata_attrs']
+        region_key = attrs.get('region_key', 'region')
+        if region_key in filtered_table.obs:
+            if hasattr(filtered_table.obs[region_key], 'cat'):
+                filtered_table.obs[region_key] = filtered_table.obs[region_key].cat.remove_unused_categories()
+            attrs['region'] = filtered_table.obs[region_key].unique().tolist()
+    plot_sdata_fov['table'] = filtered_table
+    return plot_sdata_fov
 
 def filter_labels(sdata, label_elements='cell_labels', table='table', key_col='cell_labels'):
     # Get all label elements that match the specified prefix
@@ -1273,7 +1283,9 @@ def add_cell_matcher(
         'xenium_hits': [],   # list of (xenium_cell_id, xenium_layer) — usually 1, >1 if sections overlap
         'xenium_pos': None,  # (z, y, x) world coords at pick time
         'armed': None,       # None | 'gcamp' | 'xenium'
+        'display_active': False,
     }
+    _saved_colormaps = {}  # layer_name -> colormap, saved before display-matches mode
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1371,6 +1383,10 @@ def add_cell_matcher(
 
     update_completed_btn = QPushButton("Update completed cells")
     layout.addWidget(update_completed_btn)
+
+    display_matches_btn = QPushButton("Display matches")
+    display_matches_btn.setCheckable(True)
+    layout.addWidget(display_matches_btn)
 
     status = QLabel("")
     status.setWordWrap(True)
@@ -1556,6 +1572,71 @@ def add_cell_matcher(
         n = len(matched_gcamp_ids)
         status.setText(f"Updated: {n} matched GCaMP {'cell' if n == 1 else 'cells'} highlighted.")
 
+    def _toggle_display_matches(checked):
+        from collections import defaultdict
+        from napari.utils.colormaps import DirectLabelColormap
+        import matplotlib.pyplot as _plt
+
+        if not checked:
+            # Restore saved colormaps
+            for layer in viewer.layers:
+                if layer.name in _saved_colormaps:
+                    layer.colormap = _saved_colormaps.pop(layer.name)
+            state['display_active'] = False
+            display_matches_btn.setText("Display matches")
+            display_matches_btn.setStyleSheet("")
+            status.setText("Display matches off — colormaps restored.")
+            return
+
+        if not matches:
+            display_matches_btn.setChecked(False)
+            status.setText("No matches to display yet.")
+            return
+
+        state['display_active'] = True
+        display_matches_btn.setText("Display matches (ON)")
+        display_matches_btn.setStyleSheet("background: #2a6a2a; color: white; font-weight: bold;")
+
+        # Build per-pair color lookup.
+        # One color per pair index; gcamp_id and its xenium_id share the same color.
+        cmap20 = _plt.get_cmap('tab20', 20)
+        transparent = np.zeros(4)
+
+        # gcamp: label_id -> rgba
+        gcamp_colors = defaultdict(lambda: transparent)
+        # xenium: layer_name -> {label_id -> rgba}
+        xenium_colors = defaultdict(lambda: defaultdict(lambda: transparent))
+
+        for i, m in enumerate(matches):
+            gcamp_id, xenium_id, xenium_layer_name = m[0], m[1], m[2]
+            rgba = np.array(cmap20(i % 20))
+            gcamp_colors[gcamp_id] = rgba
+            xenium_colors[xenium_layer_name][xenium_id] = rgba
+
+        # Apply to gcamp layer
+        gcamp_layer = next(
+            (l for l in viewer.layers
+             if isinstance(l, _napari.layers.Labels) and l.name.startswith(gcamp_layer_prefix)),
+            None,
+        )
+        if gcamp_layer is not None:
+            if gcamp_layer.name not in _saved_colormaps:
+                _saved_colormaps[gcamp_layer.name] = gcamp_layer.colormap
+            gcamp_layer.colormap = DirectLabelColormap(color_dict=gcamp_colors)
+
+        # Apply to each xenium layer that has matched cells
+        for layer in viewer.layers:
+            if not (isinstance(layer, _napari.layers.Labels) and layer.name.startswith(xenium_layer_prefix)):
+                continue
+            if layer.name not in xenium_colors:
+                continue
+            if layer.name not in _saved_colormaps:
+                _saved_colormaps[layer.name] = layer.colormap
+            layer.colormap = DirectLabelColormap(color_dict=xenium_colors[layer.name])
+
+        n = len(matches)
+        status.setText(f"Displaying {n} matched {'pair' if n == 1 else 'pairs'} — unmatched cells transparent.")
+
     def _delete_selected():
         selected_rows = {idx.row() for idx in table.selectedIndexes()}
         if not selected_rows:
@@ -1675,6 +1756,7 @@ def add_cell_matcher(
     undo_btn.clicked.connect(_undo)
     delete_sel_btn.clicked.connect(_delete_selected)
     update_completed_btn.clicked.connect(_update_completed_cells)
+    display_matches_btn.toggled.connect(_toggle_display_matches)
 
     _refresh_table()
     _refresh_pending()
