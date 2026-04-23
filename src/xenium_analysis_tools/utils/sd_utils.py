@@ -8,6 +8,9 @@ import pandas as pd
 import json
 from pathlib import Path
 from geopandas import GeoDataFrame
+from spatialdata._io._utils import _resolve_zarr_store
+from tqdm.notebook import tqdm as tqdm_nb
+import time
 
 def _is_multiscale(element):
     return (
@@ -57,6 +60,94 @@ def rename_chans(sdata, el, channel_name_map=None):
         sdata[el] = _rename_channel_coord(element)
 
     return sdata
+
+def write_sdata_elements(sdata, sdata_path, overwrite=False, num_workers=4):
+    """
+    Write a SpatialData object element-by-element with a progress bar.
+    
+    If overwrite=False, skips elements that already exist on disk.
+    If overwrite=True, rewrites all elements.
+    If writing fails, the partially-written element is deleted to avoid corrupted zarr.
+    """
+    import shutil
+
+    sdata_path = Path(sdata_path)
+    all_elements = list(sdata.gen_elements())  # [(etype, name, element), ...]
+
+    # --- Step 1: create/open zarr store and write root metadata ---
+    store = _resolve_zarr_store(sdata_path)
+    if sdata_path.exists():
+        zarr_group = zarr.open_group(store=store, mode='a')
+    else:
+        zarr_group = zarr.create_group(store=store, overwrite=True)
+    
+    sdata.write_attrs(zarr_group=zarr_group)
+    store.close()
+    sdata.path = sdata_path
+
+    # --- Step 2: determine which elements to write ---
+    etype_to_folder = {
+        'images': 'images',
+        'labels': 'labels', 
+        'points': 'points',
+        'shapes': 'shapes',
+        'tables': 'tables',
+    }
+
+    def _element_exists(sdata_path, etype, name):
+        folder = etype_to_folder.get(etype, etype)
+        return (sdata_path / folder / name).exists()
+
+    def _delete_element(sdata_path, etype, name):
+        folder = etype_to_folder.get(etype, etype)
+        el_path = sdata_path / folder / name
+        if el_path.exists():
+            shutil.rmtree(el_path)
+            tqdm_nb.write(f"    🗑  Deleted incomplete element at {el_path}")
+
+    to_write = []
+    skipped = []
+    for etype, name, el in all_elements:
+        if not overwrite and _element_exists(sdata_path, etype, name):
+            skipped.append((etype, name))
+        else:
+            to_write.append((etype, name, el))
+
+    if skipped:
+        print(f"Skipping {len(skipped)} already-written elements:")
+        for etype, name in skipped:
+            print(f"  [{etype}] {name} (already exists)")
+
+    if not to_write:
+        print("All elements already written. Nothing to do.")
+        return
+
+    print(f"Writing {len(to_write)} elements...")
+
+    # --- Step 3: write elements with progress bar ---
+    t0 = time.time()
+    failed = []
+    with dask.config.set(scheduler='threads', num_workers=num_workers):
+        for etype, name, _ in tqdm_nb(to_write, desc='Writing elements', unit='element'):
+            tqdm_nb.write(f"  [{etype}] {name}...")
+            t1 = time.time()
+            try:
+                sdata.write_element(name, overwrite=overwrite)
+                tqdm_nb.write(f"    done in {time.time()-t1:.1f}s")
+            except Exception as e:
+                tqdm_nb.write(f"    ✗ FAILED: {e}")
+                _delete_element(sdata_path, etype, name)
+                failed.append((etype, name, str(e)))
+
+        # --- Step 4: consolidate metadata ---
+        sdata.write_consolidated_metadata()
+
+    if failed:
+        print(f"\n⚠  {len(failed)} element(s) failed to write and were deleted:")
+        for etype, name, err in failed:
+            print(f"  [{etype}] {name}: {err}")
+    
+    print(f"Total: {(time.time()-t0)/60:.1f} min")
 
 def get_microns_scales(sdata, element_name):
     el = sdata[element_name]
