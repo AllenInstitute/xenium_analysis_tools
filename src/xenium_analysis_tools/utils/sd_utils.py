@@ -11,6 +11,7 @@ from geopandas import GeoDataFrame
 from spatialdata._io._utils import _resolve_zarr_store
 from tqdm.notebook import tqdm as tqdm_nb
 import time
+import dask
 
 def _is_multiscale(element):
     return (
