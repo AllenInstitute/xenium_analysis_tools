@@ -39,7 +39,7 @@ from xenium_analysis_tools.utils.sd_utils import (
     get_ome_metadata,
     rename_chans,
 )
-from process_sections.validation_plots import plot_section_bboxes, plot_section_overview
+from xenium_analysis_tools.process_sections.validation_plots import plot_section_bboxes, plot_section_overview
 
 #############################################
 ##### Find Xenium bundles for sections ######
