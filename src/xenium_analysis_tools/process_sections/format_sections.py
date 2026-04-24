@@ -920,7 +920,7 @@ def process_xenium_bundle(section_n, bundle_path, tmp_folder, sections_tmp_folde
     print(f"\n{'='*60}")
     print(f"Section(s): {section_n}")
     print(f"  src : {bundle_path}")
-    print(f"  tmp : {section_tmp_path.name}")
+    print(f"  tmp : {section_tmp_path}")
     print(f"  out : {[p.name for p in sections_save_paths]}")
     print(f"{'='*60}")
 
