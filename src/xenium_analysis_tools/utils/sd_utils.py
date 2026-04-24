@@ -1,5 +1,5 @@
 
-from spatialdata.transformations import Scale, Translation, Sequence, Identity, set_transformation, get_transformation
+from spatialdata.transformations import Scale, Identity, set_transformation, get_transformation
 from spatialdata.models import Image3DModel
 import spatialdata as sd
 import xarray as xr
@@ -13,6 +13,95 @@ from tqdm.notebook import tqdm as tqdm_nb
 import time
 import dask
 import zarr
+import xml.etree.ElementTree as ET
+import tifffile
+
+def add_micron_coord_sys(sdata, pixel_size=None, z_step=None):
+    # Define the pixel scaling factor
+    if pixel_size is None and 'table' in sdata:
+        pixel_size = sdata['table'].uns['section_metadata']['pixel_size']
+    if z_step is None and 'table' in sdata:
+        z_step = sdata['table'].uns['section_metadata']['z_step_size']
+    else:
+        z_step = 1.0
+
+    if isinstance(pixel_size, (int, float)):
+        pixel_size = [pixel_size, pixel_size]
+        
+    # 2D Images (channel, y, x)
+    scale_yx = Scale(pixel_size, axes=("y", "x"))
+
+    # For 3D Z-Stacks (c, z, y, x)
+    scale_czyx = Scale(
+        [z_step] + pixel_size, 
+        axes=("z", "y", "x")
+    )
+
+    identity = Identity()
+    # --- Images ---
+    for image_name in sdata.images:
+        dims = sdata[image_name].dims if not isinstance(sdata[image_name], xr.core.datatree.DataTree) else sdata[image_name]['scale0'].dims
+        if 'z' in dims:
+            set_transformation(
+                sdata.images[image_name], 
+                scale_czyx, 
+                to_coordinate_system="microns"
+            )
+        else:
+            set_transformation(
+                sdata.images[image_name], 
+                scale_yx, 
+                to_coordinate_system="microns"
+            )
+
+    # Labels
+    for label_name in sdata.labels:
+        set_transformation(
+            sdata.labels[label_name], 
+            scale_yx, 
+            to_coordinate_system="microns"
+        )
+
+    # Shapes
+    for shape_name in sdata.shapes:
+        set_transformation(
+            sdata.shapes[shape_name], 
+            identity, 
+            to_coordinate_system="microns"
+        )
+    # Points
+    for point_name in sdata.points:
+        set_transformation(
+            sdata.points[point_name], 
+            identity, 
+            to_coordinate_system="microns"
+        )
+    return sdata
+
+def get_ome_metadata(tif_path, level_n=0):
+    with tifffile.TiffFile(tif_path, is_ome=True) as tif:
+        ome_metadata = tif.ome_metadata
+        root = ET.fromstring(ome_metadata)
+        ns = {'ome': 'http://www.openmicroscopy.org/Schemas/OME/2016-06'}
+        pixels_elem = root.find('.//ome:Image/ome:Pixels', ns)
+        
+        if hasattr(tif.series[0], 'levels'):
+            page = tif.series[0].levels[level_n].pages[0]
+        else:
+            page = tif.pages[0]
+            
+        metadata = {
+            'samples_per_pixel': page.tags.get('SamplesPerPixel').value,
+            'PhysicalSizeX': float(pixels_elem.get('PhysicalSizeX', 0.2125)),
+            'PhysicalSizeY': float(pixels_elem.get('PhysicalSizeY', 0.2125)),
+            'PhysicalSizeZ': float(pixels_elem.get('PhysicalSizeZ', 3.0)),
+        }
+        if hasattr(tif.series[0], 'levels'):
+            scale_factor = 2**level_n
+            metadata['PhysicalSizeX'] *= scale_factor
+            metadata['PhysicalSizeY'] *= scale_factor
+            metadata['PhysicalSizeZ'] *= scale_factor
+    return metadata
 
 def _is_multiscale(element):
     return (
@@ -62,6 +151,16 @@ def rename_chans(sdata, el, channel_name_map=None):
         sdata[el] = _rename_channel_coord(element)
 
     return sdata
+
+def extract_scale_transform(current_transform):
+    """Extract a Scale transform from a single transform or Sequence."""
+    if hasattr(current_transform, 'transformations'):
+        for t in current_transform.transformations:
+            if isinstance(t, Scale):
+                return t
+    elif isinstance(current_transform, Scale):
+        return current_transform
+    return None
 
 def write_sdata_elements(sdata, sdata_path, overwrite=False, num_workers=4):
     """
@@ -124,32 +223,32 @@ def write_sdata_elements(sdata, sdata_path, overwrite=False, num_workers=4):
         print("All elements already written. Nothing to do.")
         return
 
-    print(f"Writing {len(to_write)} elements...")
-
-    # --- Step 3: write elements with progress bar ---
     t0 = time.time()
     failed = []
+
+    # --- Step 3: write elements, one bar whose description tracks the current element ---
     with dask.config.set(scheduler='threads', num_workers=num_workers):
-        for etype, name, _ in tqdm_nb(to_write, desc='Writing elements', unit='element'):
-            tqdm_nb.write(f"  [{etype}] {name}...")
-            t1 = time.time()
-            try:
-                sdata.write_element(name, overwrite=overwrite)
-                tqdm_nb.write(f"    done in {time.time()-t1:.1f}s")
-            except Exception as e:
-                tqdm_nb.write(f"    ✗ FAILED: {e}")
-                _delete_element(sdata_path, etype, name)
-                failed.append((etype, name, str(e)))
+        with tqdm_nb(total=len(to_write), unit='el', bar_format='{desc} {bar} {n_fmt}/{total_fmt} [{elapsed}<{remaining}{postfix}]') as pbar:
+            for etype, name, _ in to_write:
+                pbar.set_description(f"[{etype}] {name}", refresh=True)
+                t1 = time.time()
+                try:
+                    sdata.write_element(name, overwrite=overwrite)
+                    pbar.set_postfix_str(f"{time.time()-t1:.1f}s", refresh=False)
+                except Exception as e:
+                    failed.append((etype, name, str(e)))
+                    _delete_element(sdata_path, etype, name)
+                pbar.update(1)
 
         # --- Step 4: consolidate metadata ---
         sdata.write_consolidated_metadata()
 
     if failed:
-        print(f"\n⚠  {len(failed)} element(s) failed to write and were deleted:")
+        print(f"⚠  {len(failed)} element(s) failed:")
         for etype, name, err in failed:
             print(f"  [{etype}] {name}: {err}")
-    
-    print(f"Total: {(time.time()-t0)/60:.1f} min")
+
+    print(f"Done: {len(to_write) - len(failed)}/{len(to_write)} elements in {(time.time()-t0)/60:.1f} min")
 
 def get_microns_scales(sdata, element_name):
     el = sdata[element_name]
@@ -171,6 +270,7 @@ def get_microns_scales(sdata, element_name):
         x_y_tf = [microns_tf.axes.index(axis) for axis in x_y_axes if axis in microns_tf.axes]
         microns_tf = Scale([microns_tf.scale[i] for i in x_y_tf], x_y_axes)
     return microns_tf
+
 
 def get_channel_name(image, chan, print_chan_names_only=False):
     channel_aliases = {'DAPI': ['dapi','nuclear'], 
@@ -255,68 +355,6 @@ def get_dataset_paths(dataset_id,
     }
     
     return paths
-
-def add_micron_coord_sys(sdata, pixel_size=None, z_step=None):
-    # Define the pixel scaling factor
-    if pixel_size is None and 'table' in sdata:
-        pixel_size = sdata['table'].uns['section_metadata']['pixel_size']
-    if z_step is None and 'table' in sdata:
-        z_step = sdata['table'].uns['section_metadata']['z_step_size']
-    else:
-        z_step = 1.0
-
-    if isinstance(pixel_size, (int, float)):
-        pixel_size = [pixel_size, pixel_size]
-        
-    # 2D Images (channel, y, x)
-    scale_yx = Scale(pixel_size, axes=("y", "x"))
-
-    # For 3D Z-Stacks (c, z, y, x)
-    scale_czyx = Scale(
-        [z_step] + pixel_size, 
-        axes=("z", "y", "x")
-    )
-
-    identity = Identity()
-    # --- Images ---
-    for image_name in sdata.images:
-        dims = sdata[image_name].dims if not isinstance(sdata[image_name], xr.core.datatree.DataTree) else sdata[image_name]['scale0'].dims
-        if 'z' in dims:
-            set_transformation(
-                sdata.images[image_name], 
-                scale_czyx, 
-                to_coordinate_system="microns"
-            )
-        else:
-            set_transformation(
-                sdata.images[image_name], 
-                scale_yx, 
-                to_coordinate_system="microns"
-            )
-
-    # Labels
-    for label_name in sdata.labels:
-        set_transformation(
-            sdata.labels[label_name], 
-            scale_yx, 
-            to_coordinate_system="microns"
-        )
-
-    # Shapes
-    for shape_name in sdata.shapes:
-        set_transformation(
-            sdata.shapes[shape_name], 
-            identity, 
-            to_coordinate_system="microns"
-        )
-    # Points
-    for point_name in sdata.points:
-        set_transformation(
-            sdata.points[point_name], 
-            identity, 
-            to_coordinate_system="microns"
-        )
-    return sdata
 
 def get_element_bytes(el):
     try:
@@ -465,7 +503,6 @@ def get_transcripts_bboxes(transcripts, id_col='cell_labels'):
             x_max = int(np.ceil(row[('x', 'max')]))
             cell_label_bboxes[cell_label] = (z_min, y_min, x_min, z_max, y_max, x_max)
     return cell_label_bboxes
-
 
 def get_single_scale(sdata, keep_scale=2, zstack_scale=0):
     single_scale_sdata = sd.SpatialData()
