@@ -19,9 +19,9 @@ dynamic = ["version"]
 dependencies = [
     "pyarrow>=21.0.0",
     "scanpy>=1.11.5",
-    "spatialdata==0.7.3a1",
+    "spatialdata>=0.6.1",
     "spatialdata-plot",
-    "spatialdata-io>=0.1.6",
+    "spatialdata-io",
     "numpy",
     "pandas" 
 ]
