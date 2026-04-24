@@ -334,13 +334,15 @@ def get_section_bundles(
 ##############################
 
 def generate_section_sdata(bundle_path, save_path, cells_as_circles=True, gex_only=False, n_jobs=4):
+    import dask
     sdata = spatialdata_io.xenium(
             path=bundle_path,
             cells_as_circles=cells_as_circles,
             gex_only=gex_only,
             n_jobs=n_jobs,
     )
-    sdata.write(save_path)
+    with dask.config.set(scheduler='threads', num_workers=n_jobs):
+        sdata.write(save_path)
     del sdata
 
 def save_section_sdata(bundle_path, save_path, cells_as_circles=True, gex_only=False, n_jobs=4):
@@ -930,11 +932,14 @@ def process_xenium_bundle(section_n, bundle_path, tmp_folder, sections_tmp_folde
             plot_save_path = plots_folder / f'section_{section_n}_bboxes.png'
             if not plot_save_path.exists():
                 print("  [skip] Plotting section bounding boxes...")
-                sdata = sd.read_zarr(section_tmp_path)
-                sdata = process_metadata(sdata, bundle_path, sections)
+                # Prefer the bundle tmp zarr; fall back to first section zarr if it was cleaned up
+                sdata_for_plot = sd.read_zarr(
+                    section_tmp_path if section_tmp_path.exists() else sections_save_paths[0]
+                )
+                sdata_for_plot = process_metadata(sdata_for_plot, bundle_path, sections)
                 plot_section_bboxes(
-                    sdata, sdata['table'].uns['sections_bboxes'],
-                    fov_df=sdata['table'].uns['fov_metadata'],
+                    sdata_for_plot, sdata_for_plot['table'].uns['sections_bboxes'],
+                    fov_df=sdata_for_plot['table'].uns['fov_metadata'],
                     show_fovs=True, save_path=plot_save_path,
                 )
         return
@@ -955,6 +960,11 @@ def process_xenium_bundle(section_n, bundle_path, tmp_folder, sections_tmp_folde
     sdata = fix_points_category(sdata)
     sdata = process_metadata(sdata, bundle_path, sections)
     divide_section_sdata(sdata, sections, bundle_path, sections_tmp_folder, num_workers=num_workers, n_section_workers=n_section_workers)
+
+    # Delete the bundle tmp zarr now that all sections have been written.
+    # This prevents tmp zarrs from accumulating across all bundles and filling the disk.
+    if section_tmp_path.exists():
+        shutil.rmtree(section_tmp_path)
 
     if plots_folder is not None:
         print("  [3/3] Plotting section bounding boxes...")
