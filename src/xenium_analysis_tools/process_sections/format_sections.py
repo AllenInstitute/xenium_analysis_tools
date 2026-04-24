@@ -942,6 +942,13 @@ def process_xenium_bundle(section_n, bundle_path, tmp_folder, sections_tmp_folde
     print("  [1/3] Reading bundle and generating SpatialData...")
     save_section_sdata(bundle_path=bundle_path, save_path=section_tmp_path, n_jobs=num_workers)
 
+    if not section_tmp_path.exists():
+        raise RuntimeError(
+            f"Failed to generate SpatialData for bundle '{section_n}'. "
+            f"The temporary zarr was not created at {section_tmp_path}. "
+            "Check for disk space issues or other errors above."
+        )
+
     print("  [2/3] Processing metadata and dividing sections...")
     bundle_path = Path(bundle_path)
     sdata = sd.read_zarr(section_tmp_path)
