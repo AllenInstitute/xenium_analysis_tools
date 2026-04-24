@@ -32,7 +32,7 @@ from spatialdata.transformations import (
     Sequence,
 )
 
-from process_sections.sd_utils import (
+from xenium_analysis_tools.utils.sd_utils import (
     extract_scale_transform,
     write_sdata_elements,
     add_micron_coord_sys,
