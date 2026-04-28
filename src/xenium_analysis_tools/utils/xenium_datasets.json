@@ -29,7 +29,9 @@
             },
             "cortical_zstack": {
                 "image_folder": "ophys-z-stacks_748168_registered",
+                "masks_folder": "ophys-z-stacks_748168_segmented",
                 "gcamp": {
+                    "masks_tif_path": "ophys-z-stack-400x400x450-GCaMP_2024-11-04_10-32_segmented_2026-01-22_03-14-02/channel_0_ref_0/segmentation_masks.tif",
                     "img_tif_path": "ophys-z-stack-400x400x450-GCaMP_2024-11-04_10-32_registered_2025-12-18_19-23-00/channel_0_ref_0/ophys-z-stack-400x400x450-GCaMP_2024-11-04_10-32_registered_2025-12-18_19-23-00_2xREG.tif"
                 }
             },
