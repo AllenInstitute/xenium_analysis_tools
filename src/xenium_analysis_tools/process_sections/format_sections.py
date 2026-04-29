@@ -491,6 +491,36 @@ def get_fov_bboxes(fov_metadata):
     bboxes_normalized = bboxes_normalized.round().astype(int)
     return bboxes_normalized.to_dict(orient='index')
 
+def add_fov_shapes(sdata):
+    import geopandas as gpd
+    from shapely.geometry import box
+    from spatialdata.models import ShapesModel
+    from spatialdata.transformations import Scale, set_transformation
+
+    fov_df = sdata['table'].uns['fov_metadata'].copy()
+    pixel_size = fov_df['pixel_size'].iloc[0]
+
+    # Build shapely box geometries in pixel coordinates
+    geometries = [
+        box(
+            row['x_min'] / pixel_size,
+            row['y_min'] / pixel_size,
+            row['x_max'] / pixel_size,
+            row['y_max'] / pixel_size,
+        )
+        for _, row in fov_df.iterrows()
+    ]
+
+    gdf = gpd.GeoDataFrame(
+        fov_df[['fov_name', 'section']].reset_index(drop=True),
+        geometry=geometries,
+    )
+
+    fov_shapes = ShapesModel.parse(gdf)
+    set_transformation(fov_shapes, Scale([pixel_size, pixel_size], axes=('x', 'y')), to_coordinate_system='microns')
+    sdata['fov_shapes'] = fov_shapes
+    return sdata
+
 def process_metadata(sdata, xenium_bundle_path, slide_sections):
     # Main function to process metadata and store in anndata.uns
     anndata = sdata['table'].copy()
@@ -509,6 +539,8 @@ def process_metadata(sdata, xenium_bundle_path, slide_sections):
     anndata.uns['sections_bboxes'] = section_bboxes    
     anndata.uns['fov_metadata'] = fov_metadata
     sdata['table'] = anndata
+
+    sdata = add_fov_shapes(sdata)
 
     return sdata
 
@@ -928,7 +960,7 @@ def process_xenium_bundle(section_n, bundle_path, tmp_folder, sections_tmp_folde
 
     if check_existing_sdata_paths(sections_save_paths):
         print("  [skip] All sections already processed.")
-        if plots_folder is not None:
+        if plots_folder is not None and len(sections) > 1:
             plot_save_path = plots_folder / f'section_{section_n}_bboxes.png'
             if not plot_save_path.exists():
                 print("  [skip] Plotting section bounding boxes...")
@@ -966,7 +998,7 @@ def process_xenium_bundle(section_n, bundle_path, tmp_folder, sections_tmp_folde
     if section_tmp_path.exists():
         shutil.rmtree(section_tmp_path)
 
-    if plots_folder is not None:
+    if plots_folder is not None and len(sections) > 1:
         print("  [3/3] Plotting section bounding boxes...")
         plot_save_path = plots_folder / f'section_{section_n}_bboxes.png'
         if not plot_save_path.exists():

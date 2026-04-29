@@ -98,7 +98,7 @@ def plot_section_bboxes(sdata, sections_bboxes, fov_df=None, show_fovs=False, sa
     except ImportError:
         print("spatialdata_plot not found. Please install it to use this function.")
         return
-    fig, ax = plt.subplots(figsize=(10, 10))
+    fig, ax = plt.subplots(figsize=(5, 5))
     
     # Base Image (DAPI) — find the actual channel name (may have been renamed to 'dapi')
     try:
