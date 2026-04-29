@@ -171,19 +171,43 @@ def _count_element_chunks(element):
     count by 3 to get a realistic task-count estimate for the progress bar.
     """
     import numpy as np
+
+    def _get_darr(obj):
+        """Extract the underlying dask array from various element/node types."""
+        # DataTree node: variables live in .ds (xarray Dataset)
+        if hasattr(obj, 'ds') and obj.ds is not None:
+            for var in obj.ds.data_vars:
+                da = obj.ds[var]
+                if hasattr(da, 'data') and hasattr(da.data, 'numblocks'):
+                    return da.data
+                if hasattr(da, 'chunks'):
+                    return da
+        # xarray DataArray with .data
+        if hasattr(obj, 'data') and hasattr(obj.data, 'numblocks'):
+            return obj.data
+        # xarray DataArray with .chunks directly
+        if hasattr(obj, 'chunks') and obj.chunks:
+            return obj
+        return None
+
     total = 0
     if _is_multiscale(element):
         for scale_key in element.keys():
             scale_obj = element[scale_key]
-            img = scale_obj.image if hasattr(scale_obj, 'image') else scale_obj
-            if hasattr(img, 'data') and hasattr(img.data, 'numblocks'):
-                total += int(np.prod(img.data.numblocks))
-            elif hasattr(img, 'chunks'):
-                total += int(np.prod([len(c) for c in img.chunks]))
-    elif hasattr(element, 'data') and hasattr(element.data, 'numblocks'):
-        total += int(np.prod(element.data.numblocks))
-    elif hasattr(element, 'chunks'):
-        total += int(np.prod([len(c) for c in element.chunks]))
+            darr = _get_darr(scale_obj)
+            if darr is None:
+                continue
+            if hasattr(darr, 'numblocks'):
+                total += int(np.prod(darr.numblocks))
+            elif hasattr(darr, 'chunks'):
+                total += int(np.prod([len(c) for c in darr.chunks]))
+    else:
+        darr = _get_darr(element)
+        if darr is not None:
+            if hasattr(darr, 'numblocks'):
+                total += int(np.prod(darr.numblocks))
+            elif hasattr(darr, 'chunks'):
+                total += int(np.prod([len(c) for c in darr.chunks]))
     # Each chunk produces ~3 dask tasks (compute, encode, write to zarr)
     return max(total * 3, 1)
 
