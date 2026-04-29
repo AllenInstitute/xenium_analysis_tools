@@ -110,18 +110,18 @@ def get_cell_labels(section_sdata, table_el='table', labels_el='cell_labels', mu
     return cell_labels_sd
 
 def extract_bigwarp_images(sdata, 
-                                       bigwarp_projects_folder,
-                                        section_n=None, 
-                                        el_name = 'morphology_focus',
-                                        subset_channels = 'all',
-                                        multiscale_level = 2,
-                                        dtype='uint16',
-                                        normalize=False,
-                                        z_step_um=None,
-                                        resunit = 'cm',
-                                        microns_coord_sys_name = 'microns',
-                                        save_name=None,
-                                        return_sdata=True):
+                            bigwarp_projects_folder,
+                            section_n=None, 
+                            el_name = 'morphology_focus',
+                            subset_channels = 'all',
+                            multiscale_level = 2,
+                            dtype='uint16',
+                            normalize=False,
+                            z_step_um=None,
+                            resunit = 'cm',
+                            microns_coord_sys_name = 'microns',
+                            save_name=None,
+                            return_sdata=True):
     if section_n is not None:
         save_bigwarp_folder = bigwarp_projects_folder / f'section_{section_n}'
         save_bigwarp_folder.mkdir(exist_ok=True, parents=True)
@@ -197,6 +197,7 @@ def extract_bigwarp_labels(
     labels_el,
     labels_name,
     bigwarp_projects_folder,
+    multiscale_level=2,
     section_n=None,
     microns_coord_sys_name='microns',
     dtype='uint8',
@@ -217,7 +218,7 @@ def extract_bigwarp_labels(
     else:
         el = labels_el
     if _is_multiscale(el):
-        el = sd.get_pyramid_levels(el, n=2)
+        el = sd.get_pyramid_levels(el, n=multiscale_level)
 
     dims = el.dims
     microns_tf = get_transformation(el, to_coordinate_system=microns_coord_sys_name)
