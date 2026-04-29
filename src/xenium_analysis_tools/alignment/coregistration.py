@@ -120,7 +120,6 @@ def extract_bigwarp_images(sdata,
                             z_step_um=None,
                             resunit = 'cm',
                             microns_coord_sys_name = 'microns',
-                            save_name=None,
                             return_sdata=True):
     if section_n is not None:
         save_bigwarp_folder = bigwarp_projects_folder / f'section_{section_n}'

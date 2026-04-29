@@ -1,6 +1,7 @@
 
 from spatialdata.transformations import Scale, Identity, set_transformation, get_transformation
 from spatialdata.models import Image3DModel
+from dask.callbacks import Callback
 import spatialdata as sd
 import xarray as xr
 import numpy as np
@@ -162,6 +163,40 @@ def extract_scale_transform(current_transform):
         return current_transform
     return None
 
+def _count_element_chunks(element):
+    """Count total dask tasks across all scales of an element.
+
+    Dask's zarr writer generates ~3 tasks per data chunk
+    (compute → encode/compress → write), so we multiply the raw chunk
+    count by 3 to get a realistic task-count estimate for the progress bar.
+    """
+    import numpy as np
+    total = 0
+    if _is_multiscale(element):
+        for scale_key in element.keys():
+            scale_obj = element[scale_key]
+            img = scale_obj.image if hasattr(scale_obj, 'image') else scale_obj
+            if hasattr(img, 'data') and hasattr(img.data, 'numblocks'):
+                total += int(np.prod(img.data.numblocks))
+            elif hasattr(img, 'chunks'):
+                total += int(np.prod([len(c) for c in img.chunks]))
+    elif hasattr(element, 'data') and hasattr(element.data, 'numblocks'):
+        total += int(np.prod(element.data.numblocks))
+    elif hasattr(element, 'chunks'):
+        total += int(np.prod([len(c) for c in element.chunks]))
+    # Each chunk produces ~3 dask tasks (compute, encode, write to zarr)
+    return max(total * 3, 1)
+
+
+class _TqdmDaskCallback(Callback):
+    """Dask callback that increments a tqdm bar on each completed task."""
+    def __init__(self, pbar):
+        self._pbar = pbar
+
+    def _posttask(self, key, result, dsk, state, worker_id):
+        self._pbar.update(1)
+
+
 def write_sdata_elements(sdata, sdata_path, overwrite=False, num_workers=4):
     """
     Write a SpatialData object element-by-element with a progress bar.
@@ -226,19 +261,24 @@ def write_sdata_elements(sdata, sdata_path, overwrite=False, num_workers=4):
     t0 = time.time()
     failed = []
 
-    # --- Step 3: write elements, one bar whose description tracks the current element ---
+    # --- Step 3: write elements with a per-element chunk-level progress bar ---
     with dask.config.set(scheduler='threads', num_workers=num_workers):
-        with tqdm_nb(total=len(to_write), unit='el', bar_format='{desc} {bar} {n_fmt}/{total_fmt} [{elapsed}<{remaining}{postfix}]') as pbar:
-            for etype, name, _ in to_write:
-                pbar.set_description(f"[{etype}] {name}", refresh=True)
-                t1 = time.time()
+        for etype, name, el in to_write:
+            n_chunks = _count_element_chunks(el)
+            t1 = time.time()
+            with tqdm_nb(
+                total=n_chunks,
+                unit='task',
+                desc=f"[{etype}] {name}",
+                bar_format='{desc} {bar} {n_fmt}/{total_fmt} tasks [{elapsed}<{remaining}, {rate_fmt}]',
+            ) as chunk_pbar:
                 try:
-                    sdata.write_element(name, overwrite=overwrite)
-                    pbar.set_postfix_str(f"{time.time()-t1:.1f}s", refresh=False)
+                    with _TqdmDaskCallback(chunk_pbar):
+                        sdata.write_element(name, overwrite=overwrite)
+                    chunk_pbar.set_postfix_str(f"done in {time.time()-t1:.1f}s", refresh=True)
                 except Exception as e:
                     failed.append((etype, name, str(e)))
                     _delete_element(sdata_path, etype, name)
-                pbar.update(1)
 
         # --- Step 4: consolidate metadata ---
         sdata.write_consolidated_metadata()
