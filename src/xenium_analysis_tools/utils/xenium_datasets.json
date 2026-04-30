@@ -17,7 +17,7 @@
     },
     "748168": {
         "dataset_info": {
-            "xenium_name": "Xenium_738168_2025-03-12",
+            "xenium_name": "Xenium_748168_2025-03-12",
             "genotype": "Slc32a1-IRES-Cre;Oi1",
             "sectioning_depth": 450,
             "sections_thickness": 20
@@ -34,7 +34,7 @@
                 }
             },
             "xenium": {
-                "processed_data": "Xenium_738168_2025-03-12_processed",
+                "processed_data": "Xenium_748168_2025-03-12_processed",
                 "sections_bundles": {
                     "10": "output-XETG00220__0037065__1423043383__20250312__190057",
                     "9": "output-XETG00220__0037065__1423043386__20250312__190057",
