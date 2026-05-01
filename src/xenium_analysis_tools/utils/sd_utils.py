@@ -17,6 +17,174 @@ import zarr
 import xml.etree.ElementTree as ET
 import tifffile
 
+from xenium_analysis_tools.utils.env import detect_env, get_datasets_json_path
+
+def get_dataset_paths(
+    dataset_id,
+    alignment_folder_parent='scratch',
+    data_root=None,
+    scratch_root=None,
+    results_root=None,
+    code_root=None,
+    datasets_json_path=None,
+    confocal_surface_name='surface',
+    create_folders=False,
+    confocal_path=None,
+    raw_confocal_path=None,
+    gcamp_image_path=None,
+    gcamp_masks_path=None,
+    dextran_image_path=None,
+    dextran_masks_path=None,
+    sections_folder=None,
+    mapping_output=None,
+):
+    """Return resolved dataset paths from xenium_datasets.json.
+
+    Root paths default to detect_env() values (Code Ocean aware).
+    Any individual path override always wins over the JSON-derived value.
+
+    Parameters
+    ----------
+    dataset_id         : str | int  — dataset key in the JSON
+    data_root          : Path, optional — override data root
+    scratch_root       : Path, optional — override scratch root
+    results_root       : Path, optional — override results root
+    code_root          : Path, optional — override code root
+    datasets_json_path : Path, optional — explicit path to xenium_datasets.json;
+                         falls back to code_root/xenium_datasets.json, then the
+                         bundled package copy
+    confocal_surface_name : str — name of the confocal surface zarr (default 'surface')
+    create_folders     : bool — create alignment/coregistration folders if missing
+    confocal_path / raw_confocal_path / gcamp_image_path / gcamp_masks_path /
+    dextran_image_path / dextran_masks_path / sections_folder / mapping_output
+                       : Path, optional — override any specific resolved path
+    """
+    # ── Resolve root paths ────────────────────────────────────────────────
+    env = detect_env()
+    data_root    = Path(data_root)    if data_root    is not None else env['data_root']
+    scratch_root = Path(scratch_root) if scratch_root is not None else env['scratch_root']
+    results_root = Path(results_root) if results_root is not None else env['results_root']
+    code_root    = Path(code_root)    if code_root    is not None else env['code_root']
+
+    # ── Locate xenium_datasets.json ───────────────────────────────────────
+    if datasets_json_path is not None:
+        datasets_json_path = Path(datasets_json_path)
+    else:
+        _candidate = code_root / 'xenium_datasets.json'
+        datasets_json_path = _candidate if _candidate.exists() else get_datasets_json_path()
+
+    with open(datasets_json_path) as f:
+        datasets = json.load(f)
+
+    dataset_id = str(dataset_id)
+    if dataset_id not in datasets:
+        raise KeyError(f"Dataset ID '{dataset_id}' not found in {datasets_json_path}")
+
+    cfg          = datasets[dataset_id]
+    dataset_info = cfg.get('dataset_info', {})
+    dataset_paths_cfg = cfg.get('paths', {})
+
+    # ── Helpers ───────────────────────────────────────────────────────────
+    def _nested_get(dct, *keys, default=None):
+        cur = dct
+        for key in keys:
+            if not isinstance(cur, dict):
+                return default
+            cur = cur.get(key)
+            if cur is None:
+                return default
+        return cur
+
+    def _rp(base, rel):
+        if base is None or rel in (None, ''):
+            return None
+        rel = Path(rel)
+        return rel if rel.is_absolute() else base / rel
+
+    # ── Derive paths from JSON ────────────────────────────────────────────
+    xenium_dataset_name = dataset_info.get('xenium_name')
+
+    _confocal_cfg  = dataset_paths_cfg.get('confocal', {})
+    _raw_cf        = _rp(data_root, _confocal_cfg.get('raw_folder'))
+    _cf_processed  = _rp(data_root, _confocal_cfg.get('processed_folder'))
+    _cf            = (_cf_processed / f'{confocal_surface_name}.zarr') if _cf_processed else None
+
+    _czstack_cfg   = dataset_paths_cfg.get('cortical_zstack', {})
+    _zstack_path   = _rp(data_root, _czstack_cfg.get('image_folder'))
+    _zstack_masks  = _rp(data_root, _czstack_cfg.get('masks_folder'))
+    _gcamp_img     = _rp(_zstack_path,  _nested_get(_czstack_cfg, 'gcamp',   'img_tif_path'))
+    _gcamp_masks   = _rp(_zstack_masks, _nested_get(_czstack_cfg, 'gcamp',   'masks_tif_path'))
+    _dextran_img   = _rp(_zstack_path,  _nested_get(_czstack_cfg, 'dextran', 'img_tif_path'))
+    _dextran_masks = _rp(_zstack_masks, _nested_get(_czstack_cfg, 'dextran', 'masks_tif_path'))
+
+    _xenium_cfg    = dataset_paths_cfg.get('xenium', {})
+    _sdata_path    = _rp(data_root, _xenium_cfg.get('processed_data'))
+    _mapping       = _rp(data_root, _xenium_cfg.get('mapping'))
+    if xenium_dataset_name is None:
+        xenium_dataset_name = _xenium_cfg.get('name')
+
+    # ── Apply per-path overrides ─────────────────────────────────────────
+    confocal_path      = Path(confocal_path)      if confocal_path      is not None else _cf
+    raw_confocal_path  = Path(raw_confocal_path)  if raw_confocal_path  is not None else _raw_cf
+    gcamp_image_path   = Path(gcamp_image_path)   if gcamp_image_path   is not None else _gcamp_img
+    gcamp_masks_path   = Path(gcamp_masks_path)   if gcamp_masks_path   is not None else _gcamp_masks
+    dextran_image_path = Path(dextran_image_path) if dextran_image_path is not None else _dextran_img
+    dextran_masks_path = Path(dextran_masks_path) if dextran_masks_path is not None else _dextran_masks
+    sections_folder    = Path(sections_folder)    if sections_folder    is not None else _sdata_path
+    mapping_output     = Path(mapping_output)     if mapping_output     is not None else _mapping
+
+    # ── Section list ──────────────────────────────────────────────────────
+    section_ns = []
+    if sections_folder is not None and sections_folder.exists():
+        for sp in sections_folder.glob('section_*.zarr'):
+            parts = sp.stem.split('_')
+            if len(parts) > 1 and parts[1].isdigit():
+                section_ns.append(int(parts[1]))
+        section_ns = sorted(section_ns)
+
+    # ── Alignment folders ─────────────────────────────────────────────────
+    if alignment_folder_parent == 'scratch':
+        alignment_parent = scratch_root
+    elif alignment_folder_parent == 'result':
+        alignment_parent = results_root
+    else:
+        alignment_parent = Path.cwd()
+
+    alignment_folder       = alignment_parent / f'xenium_{dataset_id}_alignment'
+    coregistration_folder  = alignment_folder / 'coregistration'
+    if create_folders:
+        alignment_folder.mkdir(exist_ok=True, parents=True)
+        coregistration_folder.mkdir(exist_ok=True, parents=True)
+
+    return {
+        'dataset_id':            dataset_id,
+        'dataset_info':          dataset_info,
+        'data_root':             data_root,
+        'scratch_root':          scratch_root,
+        'results_root':          results_root,
+        'code_root':             code_root,
+        'xenium_dataset_name':   xenium_dataset_name,
+        'sdata_path':            sections_folder,
+        'sections_folder':       sections_folder,
+        'section_ns':            section_ns,
+        'mapping_output':        mapping_output,
+        'confocal_path':         confocal_path,
+        'raw_confocal_path':     raw_confocal_path,
+        'zstack_path':           _zstack_path,
+        'zstack_masks':          _zstack_masks,
+        'zstack_img_gcamp_path': gcamp_image_path,
+        'zstack_masks_gcamp_path': gcamp_masks_path,
+        'zstack_img_dextran_path': dextran_image_path,
+        'zstack_masks_dextran_path': dextran_masks_path,
+        # convenience aliases
+        'gcamp_image_path':      gcamp_image_path,
+        'gcamp_masks_path':      gcamp_masks_path,
+        'dextran_image_path':    dextran_image_path,
+        'dextran_masks_path':    dextran_masks_path,
+        'alignment_folder':      alignment_folder,
+        'coregistration_folder': coregistration_folder,
+    }
+
 def add_micron_coord_sys(sdata, pixel_size=None, z_step=None):
     # Define the pixel scaling factor
     if pixel_size is None and 'table' in sdata:
@@ -353,149 +521,6 @@ def get_channel_name(image, chan, print_chan_names_only=False):
             if alias.lower() in chan.lower():
                 return chan_label
     return chan
-
-def get_dataset_paths(dataset_id,
-                      data_root=Path('/root/capsule/data'),
-                      scratch_root=Path('/root/capsule/scratch'),
-                      results_root=Path('/root/capsule/results'),
-                      code_root=Path('/root/capsule/code'),
-                      confocal_surface_name='surface',
-                      create_folders=False):
-    """Return resolved dataset paths from datasets_names_dict.json.
-
-    Supports both:
-      1) Current nested schema: {"dataset_info": ..., "paths": ...}
-      2) Legacy flat schema used by older notebooks.
-    """
-
-    def _nested_get(dct, *keys, default=None):
-        cur = dct
-        for key in keys:
-            if not isinstance(cur, dict):
-                return default
-            cur = cur.get(key)
-            if cur is None:
-                return default
-        return cur
-
-    def _resolve_path(base, rel_path):
-        if base is None or rel_path in (None, ''):
-            return None
-        rel_path = Path(rel_path)
-        return rel_path if rel_path.is_absolute() else base / rel_path
-
-    datasets_naming_dict_path = code_root / 'datasets_names_dict.json'
-    with open(datasets_naming_dict_path) as f:
-        datasets_naming_dict = json.load(f)
-
-    dataset_id = str(dataset_id)
-    if dataset_id not in datasets_naming_dict:
-        raise KeyError(f"Dataset ID '{dataset_id}' not found in {datasets_naming_dict_path}")
-
-    dataset_config = datasets_naming_dict[dataset_id]
-    dataset_info = dataset_config.get('dataset_info', {})
-    dataset_paths = dataset_config.get('paths', {})
-
-    # Defaults used by both schemas
-    xenium_dataset_name = dataset_info.get('xenium_name')
-    raw_confocal_path = None
-    confocal_path = None
-    zstack_path = None
-    zstack_masks = None
-    zstack_img_gcamp_path = None
-    zstack_masks_gcamp_path = None
-    zstack_img_dextran_path = None
-    zstack_masks_dextran_path = None
-    mapping_output = None
-
-    if dataset_paths:
-        # Current nested schema
-        confocal_cfg = dataset_paths.get('confocal', {})
-        raw_confocal_path = _resolve_path(data_root, confocal_cfg.get('raw_folder'))
-        confocal_processed_folder = _resolve_path(data_root, confocal_cfg.get('processed_folder'))
-        if confocal_processed_folder is not None:
-            confocal_path = confocal_processed_folder / f'{confocal_surface_name}.zarr'
-
-        cortical_cfg = dataset_paths.get('cortical_zstack', {})
-        zstack_path = _resolve_path(data_root, cortical_cfg.get('image_folder'))
-        zstack_masks = _resolve_path(data_root, cortical_cfg.get('masks_folder'))
-        zstack_img_gcamp_path = _resolve_path(zstack_path, _nested_get(cortical_cfg, 'gcamp', 'img_tif_path'))
-        zstack_masks_gcamp_path = _resolve_path(zstack_masks, _nested_get(cortical_cfg, 'gcamp', 'masks_tif_path'))
-        zstack_img_dextran_path = _resolve_path(zstack_path, _nested_get(cortical_cfg, 'dextran', 'img_tif_path'))
-        zstack_masks_dextran_path = _resolve_path(zstack_masks, _nested_get(cortical_cfg, 'dextran', 'masks_tif_path'))
-
-        xenium_cfg = dataset_paths.get('xenium', {})
-        sdata_path = _resolve_path(data_root, xenium_cfg.get('processed_data'))
-        mapping_output = _resolve_path(data_root, xenium_cfg.get('mapping'))
-        if xenium_dataset_name is None:
-            xenium_dataset_name = xenium_cfg.get('name')
-    else:
-        # Legacy flat schema
-        zstack_data_asset_folder = dataset_config.get('zstack_data_asset_folder')
-        zstack_masks_folder = dataset_config.get('zstack_masks_folder')
-        legacy_zstack_path = data_root / dataset_config['zstack_name'] if dataset_config.get('zstack_name') else None
-        legacy_zstack_masks = data_root / dataset_config['zstack_masks_name'] if dataset_config.get('zstack_masks_name') else None
-
-        zstack_path = data_root / zstack_data_asset_folder if zstack_data_asset_folder else legacy_zstack_path
-        zstack_masks = data_root / zstack_masks_folder if zstack_masks_folder else legacy_zstack_masks
-        zstack_img_gcamp_path = _resolve_path(zstack_path, dataset_config.get('zstack_img_gcamp_path'))
-        zstack_masks_gcamp_path = _resolve_path(zstack_masks, dataset_config.get('zstack_masks_gcamp_path'))
-        zstack_img_dextran_path = _resolve_path(zstack_path, dataset_config.get('zstack_img_dextran_path'))
-        zstack_masks_dextran_path = _resolve_path(zstack_masks, dataset_config.get('zstack_masks_dextran_path'))
-
-        if xenium_dataset_name is None:
-            xenium_dataset_name = dataset_config.get('xenium_name')
-        sdata_path = data_root / f'{xenium_dataset_name}_processed' if xenium_dataset_name else None
-        confocal_path = _resolve_path(data_root, dataset_config.get('confocal_name'))
-        raw_confocal_path = _resolve_path(data_root, dataset_config.get('raw_confocal_name'))
-
-    sections_folder = sdata_path
-    section_ns = []
-    if sections_folder is not None and sections_folder.exists():
-        for section_path in sections_folder.glob('section_*.zarr'):
-            parts = section_path.stem.split('_')
-            if len(parts) > 1 and parts[1].isdigit():
-                section_ns.append(int(parts[1]))
-        section_ns = sorted(section_ns)
-
-    alignment_folder = scratch_root / f'xenium_{dataset_id}_alignment'
-    coregistration_folder = alignment_folder / 'coregistration'
-    bigwarp_projects_folder = coregistration_folder / 'bigwarp_projects'
-    if create_folders:
-        coregistration_folder.mkdir(exist_ok=True, parents=True)
-        bigwarp_projects_folder.mkdir(exist_ok=True)
-
-    paths = {
-        'dataset_id': dataset_id,
-        'dataset_info': dataset_info,
-        'dataset_paths': dataset_paths,
-        'data_root': data_root,
-        'scratch_root': scratch_root,
-        'results_root': results_root,
-        'xenium_dataset_name': xenium_dataset_name,
-        'sdata_path': sdata_path,
-        'sections_folder': sections_folder,
-        'section_ns': section_ns,
-        'mapping_output': mapping_output,
-        'confocal_path': confocal_path,
-        'raw_confocal_path': raw_confocal_path,
-        'zstack_path': zstack_path,
-        'zstack_masks': zstack_masks,
-        'zstack_img_gcamp_path': zstack_img_gcamp_path,
-        'zstack_masks_gcamp_path': zstack_masks_gcamp_path,
-        'zstack_img_dextran_path': zstack_img_dextran_path,
-        'zstack_masks_dextran_path': zstack_masks_dextran_path,
-        # aliases that match newer notebook variable names
-        'gcamp_image_path': zstack_img_gcamp_path,
-        'gcamp_masks_path': zstack_masks_gcamp_path,
-        'dextran_image_path': zstack_img_dextran_path,
-        'dextran_masks_path': zstack_masks_dextran_path,
-        'alignment_folder': alignment_folder,
-        'coregistration_folder': coregistration_folder,
-        'bigwarp_projects_folder': bigwarp_projects_folder,
-    }
-
-    return paths
 
 def get_element_bytes(el):
     try:

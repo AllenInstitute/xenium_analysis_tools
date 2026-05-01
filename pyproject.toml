@@ -48,6 +48,9 @@ dev = [
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+xenium_analysis_tools = ["data/*.json"]
+
 [tool.setuptools.dynamic]
 version = {attr = "xenium_analysis_tools.__version__"}
 
